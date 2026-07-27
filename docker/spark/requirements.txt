@@ -1,0 +1,6 @@
+# Runtime deps for the Spark image. Pinned separately from the repo-root
+# requirements.txt, which stays PySpark-free so CI can lint and unit-test the
+# pure transform logic without a JVM.
+pyspark==3.5.3
+boto3==1.34.162
+python-dotenv==1.0.1

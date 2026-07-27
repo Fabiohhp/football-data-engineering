@@ -1,6 +1,9 @@
 # Environment
 .env
 
+# Exploration notebooks (source discovery; not part of the committed pipeline)
+notebooks/
+
 # Python
 __pycache__/
 *.pyc
