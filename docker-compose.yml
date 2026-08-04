@@ -56,13 +56,24 @@ services:
       MINIO_ENDPOINT: ${MINIO_ENDPOINT}
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # The Silver -> Gold driver runs here (`spark-submit` is exec'd into this
+      # container), and it both stages over JDBC and merges via psycopg2.
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     ports:
       - "7077:7077"
       - "8080:8080"
     volumes:
       - ./src:/opt/football/src:ro
+      # The merge statements are read at run time by the driver.
+      - ./sql:/opt/football/sql:ro
     depends_on:
       minio:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8080 >/dev/null || exit 1"]
@@ -93,6 +104,7 @@ services:
       - "8081:8081"
     volumes:
       - ./src:/opt/football/src:ro
+      - ./sql:/opt/football/sql:ro
     depends_on:
       spark-master:
         condition: service_healthy

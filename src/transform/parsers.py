@@ -34,8 +34,11 @@ logger = get_logger(__name__)
 
 _UNDERSTAT_DT_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# Football-Data's score.winner -> the single-character result code used in Gold.
-_WINNER_TO_RESULT = {"HOME_TEAM": "H", "AWAY_TEAM": "A", "DRAW": "D"}
+# Football-Data's score.winner -> the compact result code stored in Silver.
+# Public because the Gold load inverts it: fact_matches keeps the verbose form,
+# which is what analytics consumers read, and deriving one from the other here
+# means the two encodings cannot drift apart.
+WINNER_TO_RESULT = {"HOME_TEAM": "H", "AWAY_TEAM": "A", "DRAW": "D"}
 
 
 def _to_int(value: Any) -> int | None:
@@ -155,7 +158,7 @@ def parse_football_data_matches(payload: dict[str, Any]) -> list[dict[str, Any]]
                 "away_goals_ft": _to_int(full_time.get("away")),
                 "home_goals_ht": _to_int(half_time.get("home")),
                 "away_goals_ht": _to_int(half_time.get("away")),
-                "result": _WINNER_TO_RESULT.get(str(score.get("winner"))),
+                "result": WINNER_TO_RESULT.get(str(score.get("winner"))),
                 **_pick_referee(match.get("referees")),
             }
         )

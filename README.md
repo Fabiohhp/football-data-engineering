@@ -7,9 +7,11 @@ See `CLAUDE.md` for full architecture, source constraints, and conventions.
 
 ## Status
 
-Extraction and the Bronze→Silver transform are working end-to-end. Currently
+The pipeline runs end-to-end from extraction through to the Gold star schema in
+PostgreSQL, and the loaded warehouse passes its data quality checks. Currently
 running: PostgreSQL (warehouse), MinIO (Bronze/Silver), and a standalone Spark
-cluster. Airflow orchestration and the Silver→Gold load are the next steps.
+cluster. Airflow orchestration is the remaining step — every stage exists as a
+re-runnable, date-parameterized entry point waiting to be wired into the DAG.
 
 Implemented so far:
 
@@ -17,9 +19,13 @@ Implemented so far:
   team-name normalization, shared source constants.
 - `src/extract/` — Football-Data.org and Understat extractors writing raw JSON
   to Bronze (rate-limited, incremental, idempotent, retrying).
-- `src/transform/` — `parsers.py` (pure, JVM-free flatteners) and
-  `bronze_to_silver.py` (PySpark job producing typed Parquet).
-- `sql/ddl/` — Gold-layer star schema (see below).
+- `src/transform/` — `parsers.py` (pure, JVM-free flatteners),
+  `bronze_to_silver.py` (PySpark job producing typed Parquet), and
+  `silver_to_gold.py` (PySpark job loading the star schema).
+- `src/quality/` — the Gold-layer data quality suite (`checks.py` catalogue,
+  `run_checks.py` runner) that fails the pipeline on corrupt data.
+- `sql/ddl/` — Gold-layer star schema and the staging tables (see below).
+- `sql/load/` — the Silver→Gold merge statements.
 
 ## Quickstart
 
@@ -106,20 +112,74 @@ on `(match_date, home_team, away_team)`, and they agree on **23 of 23 scorelines
 an independent check that the team-name canonicalization is joining the right
 clubs.
 
+## Gold layer load (Silver → PostgreSQL)
+
+`src/transform/silver_to_gold.py` loads one date of Silver into the star schema:
+
+```bash
+docker compose exec spark-master spark-submit \
+  --master spark://spark-master:7077 \
+  /opt/football/src/transform/silver_to_gold.py --date 2025-11-01
+```
+
+Design notes:
+
+- **Stage, then merge.** Spark's JDBC writer only appends or overwrites, and
+  neither is an upsert — appending duplicates a re-run, overwriting destroys
+  every earlier date. So Spark lands the date's rows in `staging.*`
+  (`sql/ddl/30_staging.sql`) and the SQL in `sql/load/` merges them into `gold`.
+  Surrogate keys, SCD Type 2 and idempotency are decided in SQL, next to the
+  rows they have to reconcile.
+- **One transaction.** Every merge statement runs on one connection inside a
+  single transaction, so a failure anywhere leaves Gold exactly as it was.
+- **Self-verifying.** The fact loads join on team and player keys, so an
+  unmapped club would silently shorten a fact table. Each one ends by asserting
+  that every staged row reached Gold and raises if not — a failed run rather
+  than a quietly incomplete one.
+- **Matches are resolved on either source id**, not upserted on one. `fact_matches`
+  has two partial unique indexes (one per source); a match that arrived
+  Understat-only and later gains its Football-Data id has to update that row,
+  not insert a second one. Measures are merged with `COALESCE`, so a source with
+  nothing to say about a match never erases what the other source said.
+- **SCD Type 2 tracks transfers, not formations.** A new `dim_players` version
+  opens when the club or the name changes. Position is a Type 1 attribute: it is
+  the position played *in that match*, and a substitute is literally `Sub`, so
+  versioning on it would mint a row per matchday and bury the transfers.
+
+Verified on `2025-11-01`:
+
+| Check | Result |
+|-------|--------|
+| Rows loaded | 23 matches, 715 player events, 540 shots, 46 teams, 715 players, 23 referees |
+| Fact FKs resolved | 0 rows on the `Unknown` member for team, player or referee |
+| Player ↔ team agreement | 715/715 events where the player's dimension club equals the club he played for |
+| Assists resolved | 404/540 shots carry an assisting player (the rest are unassisted) |
+| **Idempotency** | second run of the same date: counts identical, `max(match_key)`/`max(player_key)` unchanged — no rows and no surrogate keys burned |
+| **SCD Type 2** | simulated transfer on a later date closes the old version at `valid_to = date - 1` and opens the new one; an unchanged player is untouched |
+
 ## Gold layer schema
 
 The Gold layer is a **star schema** in the `gold` schema of PostgreSQL, and is
 the stable contract consumed by the downstream analytics (Part 2) and ML
 (Part 3) subprojects. DDL lives in `sql/ddl/` and is applied automatically by
 Postgres on first startup (`docker-entrypoint-initdb.d`, run in filename order:
-`00` schema → `1x` dimensions → `2x` facts).
+`00` schema → `1x` dimensions → `2x` facts → `30` staging).
+
+> `docker-entrypoint-initdb.d` only runs when the data directory is **empty**.
+> If your `postgres_data` volume predates a DDL change, apply it by hand — every
+> file is idempotent (`CREATE TABLE IF NOT EXISTS`, `ON CONFLICT DO NOTHING`):
+>
+> ```bash
+> for f in sql/ddl/*.sql; do docker compose exec -T postgres \
+>   psql -v ON_ERROR_STOP=1 -U football -d football_dw -q < "$f"; done
+> ```
 
 ### Dimensions
 
 | Table | Grain | SCD | Source | Notes |
 |-------|-------|-----|--------|-------|
-| `dim_teams` | one club | Type 1 | Football-Data + Understat | `canonical_name` is the cross-source join key (see `src/common/team_mapping.py`); both source ids retained. |
-| `dim_players` | one player **version** | **Type 2** | Understat | Tracks club/position history via `valid_from`/`valid_to`/`is_current`; `understat_player_id` is the durable business key. |
+| `dim_teams` | one club | Type 1 | Football-Data + Understat | `canonical_name` is the cross-source join key (see `src/common/team_mapping.py`); each source's own spelling and id are kept beside it, so the conforming decision is auditable from the dimension itself. |
+| `dim_players` | one player **version** | **Type 2** | Understat | Tracks club history via `valid_from`/`valid_to`/`is_current`; `understat_player_id` is the durable business key. Position is Type 1 (see the load notes above). |
 | `dim_referees` | one official | Type 1 | Football-Data | From `match.referees`. |
 | `dim_stadiums` | one venue | Type 1 | — | **Placeholder** (only the `Unknown` member). No live source: Football-Data free tier omits venue, FBref is blocked. |
 
@@ -145,6 +205,11 @@ Postgres on first startup (`docker-entrypoint-initdb.d`, run in filename order:
 - **Not modeled (FBref-blocked):** possession, total passes, tackles, and real
   stadium data. FBref is the only source for these and is Cloudflare-blocked; we
   deliberately do not ship all-null columns for them.
+- **Not modeled (not ingested):** club crest, TLA and colours. They live only on
+  Football-Data's `/competitions/{code}/teams` endpoint, which this pipeline does
+  not call — same rule: no all-null columns in the contract. Adding that call
+  would also give `dim_stadiums` real venues and is the obvious way to retire the
+  placeholder.
 
 Validate the DDL against a throwaway Postgres:
 
@@ -153,6 +218,56 @@ docker run --rm -d --name ddl-check -e POSTGRES_PASSWORD=x -e POSTGRES_DB=footba
 for f in sql/ddl/*.sql; do docker exec -i ddl-check psql -v ON_ERROR_STOP=1 -U postgres -d football_dw < "$f"; done
 docker rm -f ddl-check
 ```
+
+## Data quality checks
+
+`src/quality/` validates the Gold layer and is the pipeline's last step — the
+task that decides whether a night's load is fit to publish:
+
+```bash
+docker compose exec -w /opt/football spark-master python -m src.quality.run_checks
+```
+
+It exits non-zero (and raises `DataQualityError`, which fails an Airflow task) if
+any **ERROR** check finds violations. `src/quality/checks.py` holds the catalogue
+— each check is one `SELECT` counting offending rows, paired with its severity
+and the reason breaking it matters.
+
+Design notes:
+
+- **Only rules the schema cannot express.** Primary keys, foreign keys,
+  `NOT NULL` and the `CHECK` constraints are already unbreakable by a committed
+  row, so asserting them would just re-prove that Postgres works. Every check
+  covers something the DDL *can't* state: an SCD window that overlaps, a fact
+  whose two source rows never got paired, a `result` contradicting its own score.
+- **ERROR vs WARN.** ERROR means a consumer would be misled, and fails the run.
+  WARN means the rule has a legitimate way of being false — a source omitting a
+  field, or a state the model explicitly permits (`match_key` is nullable by
+  design). Keeping the two apart is what stops a known source quirk from
+  reddening the DAG nightly and training everyone to ignore it.
+- **Whole warehouse, not one date.** Restricting the checks to the date just
+  loaded would miss corruption an earlier run introduced — an SCD version that
+  only starts overlapping once a later transfer opens the next one. Gold is small
+  and these are invariants about the star schema, not about a partition of it.
+- **All checks run before anything raises**, so one red run shows the whole
+  shape of the problem rather than just its first symptom.
+
+Coverage: 21 checks — cross-source id collisions and unconformed clubs
+(`dim_teams`); overlapping versions, current-flag consistency, every player
+having a current version (`dim_players`); fixture-grain duplication, missing
+scores on finished matches, result/score agreement (`fact_matches`); the same
+player counted twice under two versions, and the club he played for disagreeing
+with his dimension version (`fact_player_events`); pitch coordinates, and goals
+reconciling against `fact_player_events` (`fact_shots`). Each fact table is
+guarded against `Unknown`-member leakage, which is how an unresolved key
+surfaces given the `NOT NULL` FKs — a test enforces that guard exists.
+
+**Verified by fault injection.** All 21 pass on the loaded warehouse, but a check
+that never fires proves nothing. Each was re-run against a deliberately corrupted
+copy of its target table inside a rolled-back transaction — a duplicated fixture,
+a nulled score, an overlapping SCD window, an out-of-pitch coordinate, and so on.
+**21/21 detected the violation they claim to catch**, and the rollbacks left row
+counts unchanged.
 
 ## Development
 

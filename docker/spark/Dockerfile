@@ -46,6 +46,13 @@ RUN curl -fsSL -o "${SPARK_HOME}/jars/hadoop-aws-${HADOOP_AWS_VERSION}.jar" \
     && curl -fsSL -o "${SPARK_HOME}/jars/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" \
         "${MAVEN}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"
 
+# JDBC driver for the Silver -> Gold load. Needed in the image rather than via
+# --packages because the executors open their own connections to Postgres, so
+# every node has to have it on the classpath.
+ARG POSTGRES_JDBC_VERSION=42.7.4
+RUN curl -fsSL -o "${SPARK_HOME}/jars/postgresql-${POSTGRES_JDBC_VERSION}.jar" \
+        "${MAVEN}/org/postgresql/postgresql/${POSTGRES_JDBC_VERSION}/postgresql-${POSTGRES_JDBC_VERSION}.jar"
+
 # Spark writes scratch, shuffle files and per-executor work dirs as the running
 # user. Their defaults sit under SPARK_HOME — i.e. inside root-owned
 # site-packages — so a non-root worker cannot create them and dies on startup

@@ -65,6 +65,12 @@ class PostgresConfig:
             f"@{self.host}:{self.port}/{self.database}"
         )
 
+    @property
+    def jdbc_url(self) -> str:
+        """URL for Spark's JDBC writer. Credentials go in separate options, not
+        here — a JDBC URL ends up in Spark UI pages and executor logs."""
+        return f"jdbc:postgresql://{self.host}:{self.port}/{self.database}"
+
 
 @dataclass(frozen=True)
 class MinioConfig:
