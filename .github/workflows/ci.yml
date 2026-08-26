@@ -5,6 +5,8 @@ on:
   pull_request:
 
 jobs:
+  # Fast feedback: lint, format and the JVM-free unit tests. The DAG tests skip
+  # here (no Airflow installed) and get their own job below.
   lint-and-test:
     runs-on: ubuntu-latest
     steps:
@@ -13,15 +15,105 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Lint (ruff)
-        run: ruff check src tests
+        run: ruff check src tests airflow/dags
 
       - name: Format check (black)
-        run: black --check src tests
+        run: black --check src tests airflow/dags
 
       - name: Run tests
         run: pytest -q
+
+  # A broken DAG file does not fail loudly — Airflow records an import error and
+  # schedules nothing, and the first symptom is a day with no data. This job
+  # catches that before it reaches the scheduler.
+  dag-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-airflow.txt
+
+      - name: Install Airflow
+        env:
+          # Pinned in step with requirements-airflow.txt and
+          # docker/airflow/Dockerfile, so CI validates the DAG against the same
+          # Airflow that will run it.
+          CONSTRAINTS: https://raw.githubusercontent.com/apache/airflow/constraints-3.1.8/constraints-3.11.txt
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-airflow.txt --constraint "$CONSTRAINTS"
+          # --no-deps: the provider declares pyspark>=3.5.2, but its operator and
+          # hook only shell out to the `spark-submit` binary and never import it.
+          # Skipping the dependency keeps a 300 MB wheel out of CI for something
+          # no test touches. (The Airflow *image* does install pyspark — that is
+          # where spark-submit actually has to exist.)
+          pip install --no-deps apache-airflow-providers-apache-spark==5.5.1
+
+      - name: Verify Airflow itself is importable
+        # Every DAG test module starts with pytest.importorskip("airflow.sdk").
+        # That is right for the local JVM-free suite, but in *this* job a
+        # degraded install would turn the run below into "3 skipped", exit 0 and
+        # a green build that verified nothing about the DAGs. Fail here instead,
+        # where the cause is obvious.
+        run: |
+          python -c "import airflow.sdk"
+          python -c "from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator"
+
+      - name: Verify the DAGs import and are wired to each other correctly
+        run: |
+          pytest -q \
+            tests/test_dag_integrity.py \
+            tests/test_football_connections.py \
+            tests/test_football_run_date.py
+
+  # The two PySpark modules are the largest single piece of logic in the repo and
+  # the only one the default suite cannot reach — it installs no JVM. Their
+  # failures are joins that drop or duplicate rows, which no amount of testing
+  # the pure helpers around them would catch.
+  spark-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-spark.txt
+
+      - name: Install PySpark
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-spark.txt
+
+      - name: Verify PySpark itself is importable
+        # Same reason as the Airflow guard above: both Spark test modules begin
+        # with pytest.importorskip("pyspark"), so a broken install would report
+        # "2 skipped", exit 0, and go green having executed no Spark at all.
+        run: python -c "import pyspark; print(pyspark.__version__)"
+
+      - name: Run the Spark transform tests
+        run: |
+          pytest -q \
+            tests/test_bronze_to_silver_spark.py \
+            tests/test_silver_to_gold_spark.py

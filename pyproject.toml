@@ -5,10 +5,16 @@ target-version = ["py311"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+# airflow/dags is on this list so that ruff resolves `football_connections` as a
+# first-party import: Airflow puts the DAG folder on sys.path, and without this
+# the isort rules would sort it in with third-party packages.
+src = ["src", "tests", "airflow/dags"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Airflow puts the DAG folder on sys.path at run time; mirror that so the DAG
+# tests can import `football_connections` the same way the DAG itself does.
+pythonpath = ["airflow/dags"]

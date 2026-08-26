@@ -27,7 +27,7 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
 
 | Phase | Scope | Covered by this CLAUDE.md? | Status |
 |-------|-------|----------------------------|--------|
-| **Part 1 — Data Engineering & Architecture** | Ingestion, orchestration, lakehouse, dimensional modeling, data quality, CI/CD | ✅ Yes — this file | **In progress** |
+| **Part 1 — Data Engineering & Architecture** | Ingestion, orchestration, lakehouse, dimensional modeling, data quality, CI/CD | ✅ Yes — this file | **Complete** |
 | Part 2 — Analytics & BI | Dashboards, KPIs, exploratory analysis on top of the Gold layer | ❌ No (separate subproject, own context) | Not started |
 | Part 3 — Machine Learning | Match outcome / xG prediction models trained on the Gold tables this project produces | ❌ No (separate subproject, own context) | Not started |
 
@@ -50,7 +50,7 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
 | Layer | Technology | Notes |
 |-------|-----------|-------|
 | Infrastructure | **Docker & Docker Compose** | Single-command startup for reviewers |
-| Orchestration | **Apache Airflow** | Webserver + Scheduler + Worker |
+| Orchestration | **Apache Airflow 3.1.8** | api-server + scheduler + dag-processor + triggerer, **LocalExecutor** |
 | Data Lake (object storage) | **MinIO** | Local S3-compatible store for Bronze/Silver |
 | Processing | **Apache Spark (PySpark)** | Silver and Gold transformations |
 | Data Warehouse | **PostgreSQL** | Serves final Gold tables + Airflow metadata |
@@ -59,6 +59,18 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
 
 > Spark is intentionally used even though the data volume is small. The goal is
 > to demonstrate familiarity with big-data tooling for a portfolio context.
+
+> **Executor choice.** LocalExecutor, not Celery: tasks run as subprocesses of
+> the scheduler. A broker and a dedicated worker container buy nothing at this
+> data volume (one date is ~1300 rows), and the Spark driver runs in the
+> scheduler container under client mode, so it needs the headroom. The four
+> Airflow components as configured measure ~1.1 GB.
+>
+> **PySpark in the Airflow image is pinned to the cluster's version (3.5.3).**
+> Airflow's constraints file resolves pyspark to 4.x, and a Spark 4 client
+> cannot drive a Spark 3.5 standalone master. `docker/airflow/Dockerfile`
+> filters `pyspark` and `py4j` out of the constraints before installing. Keep it
+> equal to `docker/spark/requirements.txt`.
 
 ---
 
@@ -97,7 +109,10 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
   (e.g. `"Man Utd"` → `"Manchester United"`), handle nulls. Output **Parquet**.
 - **Gold** — **Dimensional model (Star Schema)** written to PostgreSQL:
   - Dimensions: `dim_players`, `dim_teams`, `dim_stadiums`, `dim_referees`
-    (treat as **Slowly Changing Dimensions** where appropriate).
+    (treat as **Slowly Changing Dimensions** where appropriate). `dim_stadiums`
+    is fed by Football-Data's `/competitions/{code}/teams` endpoint, which is the
+    only venue source available — it supplies the ground's name, country and a
+    free-form address, but no city or capacity.
   - Facts: `fact_matches` (result, possession, xG),
     `fact_player_events` (passes, shots, tackles per match).
 
@@ -126,6 +141,10 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
 - Real API with token auth and documentation.
 - **Free tier (Tier 1): 12 competitions, 10 calls/minute.**
 - No player-level stats (no shots/passes/tackles) — results & tables only.
+- `/competitions/{code}/teams` is the **only venue source** in the project and
+  what populates `dim_stadiums`. Always pass `?season=` — it defaults to the
+  current season, so a backfill without it resolves grounds against today's
+  clubs rather than the ones that played that season.
 - Store the API token in `.env`, never commit it.
 
 ### Mandatory extraction rules
@@ -143,23 +162,30 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
 
 ```
 football-data-platform/
-├── .github/workflows/ci.yml      # GitHub Actions: lint + tests
+├── .github/workflows/ci.yml      # GitHub Actions: lint + tests + DAG tests
 ├── airflow/
-│   ├── dags/                     # DAG definitions
+│   ├── dags/                     # bronze_/silver_/gold_ DAGs, assets/,
+│   │                             # football_conf.py, football_connections.py,
+│   │                             # football_run_date.py, .airflowignore
 │   ├── plugins/
 │   └── config/
 ├── docker/
-│   ├── airflow/Dockerfile
+│   ├── airflow/Dockerfile        # Airflow + JVM + Spark 3.5.3 client
 │   └── spark/Dockerfile
 ├── src/
 │   ├── extract/                  # extract_fbref.py, extract_understat.py, ...
 │   ├── transform/                # bronze_to_silver.py, silver_to_gold.py
 │   ├── common/                   # config, minio_client, logging, team_mapping
 │   └── quality/                  # data quality checks / expectations
-├── sql/ddl/                      # CREATE TABLE statements for Gold schema
+├── sql/
+│   ├── ddl/                      # CREATE TABLE statements for Gold schema
+│   ├── load/                     # Silver -> Gold merge statements
+│   └── airflow/                  # Airflow metadata role/database bootstrap
 ├── tests/                        # pytest unit tests
 ├── docker-compose.yml
-├── requirements.txt
+├── requirements.txt              # core dev deps; no Airflow, no PySpark
+├── requirements-airflow.txt      # Airflow, for CI's DAG tests only
+├── requirements-spark.txt        # PySpark, for CI's Spark transform tests only
 ├── pyproject.toml                # ruff/black config
 ├── .env.example                  # template; real .env is gitignored
 └── README.md
@@ -179,34 +205,83 @@ docker compose logs -f airflow-scheduler
 # Stop and remove containers
 docker compose down
 
-# Run unit tests
+# Run unit tests. The DAG tests and the two PySpark transform suites skip on
+# this install by design — requirements.txt carries neither Airflow nor PySpark,
+# so the core suite needs no JVM and no scheduler. CI runs them in their own
+# jobs (see requirements-airflow.txt / requirements-spark.txt).
 pytest -q
 
 # Lint & format (must pass in CI)
-ruff check src tests
-black --check src tests
+ruff check src tests airflow/dags
+black --check src tests airflow/dags
 
-# Trigger the pipeline manually inside the Airflow container
-docker compose exec airflow-webserver airflow dags trigger daily_football_pipeline
+# Run the whole chain for one date: Bronze publishes its assets, which trigger
+# Silver, which triggers Gold. Nothing else needs to be started by hand.
+docker compose exec airflow-scheduler airflow dags trigger bronze_football_matches \
+  --conf '{"match_date": "2025-11-01"}'
+
+# Re-run one layer only (repairing Silver or Gold without re-scraping Bronze).
+docker compose exec airflow-scheduler airflow dags trigger silver_football_matches \
+  --conf '{"match_date": "2025-11-01"}'
 ```
+
+> Airflow UI: http://localhost:8088 (not 8080 — the Spark master has that).
+> Every DAG takes the same `match_date` conf, and it is the only way to aim a
+> run at a specific day: Silver and Gold are triggered by assets, so their runs
+> have no logical date to backfill against.
 
 > If a command depends on infrastructure that isn't running, say so instead of
 > guessing — do not invent output.
 
 ---
 
-## 7. The Airflow DAG
+## 7. The Airflow DAGs
 
-Single daily DAG (`schedule_interval="@daily"`). Expected task flow:
+**One DAG per medallion layer, chained by assets** — not one DAG with five
+tasks. Each layer owns its own schedule, retries, replays and failures, and the
+handoff between them is an Airflow 3 asset event rather than an edge inside a
+single graph. Written with the TaskFlow API (`@dag` / `@task` from
+`airflow.sdk`).
 
-1. `check_if_api_is_available` — Sensor / availability check.
-2. `extract_daily_matches_to_bronze` — PythonOperator (rate-limited, incremental).
-3. `process_bronze_to_silver_spark` — SparkSubmitOperator.
-4. `load_silver_to_gold_postgres` — SparkSubmitOperator or PostgresOperator.
-5. `data_quality_check` — Fail the run if nulls/duplicates are detected.
+| DAG | Trigger | Tasks | Publishes |
+|-----|---------|-------|-----------|
+| `bronze_football_matches` | `schedule="0 6 * * *"` | `check_if_api_is_available` (sensor, `reschedule`), `extract_football_data`, `extract_football_data_teams`, `extract_understat` | `bronze_*` assets |
+| `silver_football_matches` | all three `bronze_*` assets | `resolve_match_date`, `process_bronze_to_silver_spark` (SparkSubmit), `publish_silver_tables` | `silver_*` assets |
+| `gold_football_star_schema` | all five `silver_*` assets | `resolve_match_date`, `load_silver_to_gold_postgres` (SparkSubmit), `data_quality_check` | `gold_*` assets |
 
-Keep tasks small, retryable, and idempotent. Use Airflow Connections (not
-hardcoded credentials) to reach MinIO and Postgres.
+Rules for anything added here:
+
+- **Assets are declared in `airflow/dags/assets/football.py`, never inline.** A
+  producer and a consumer that name assets separately can drift apart by one
+  character, and the only symptom is a downstream DAG that silently stops
+  running. A list in `schedule=` is an AND: every asset must be updated.
+- **Pass the run's date, never compute it.** Bronze takes `{{ ds }}`; Silver and
+  Gold read the date off the asset event that triggered them
+  (`airflow/dags/football_run_date.py`), because an asset-triggered run has no
+  logical date of its own. Every DAG also accepts a `match_date` conf override,
+  which is how one layer is replayed for one day. A task that calls
+  `date.today()` looks correct until its first retry after midnight.
+- **`schedule="0 6 * * *"`** on Bronze — an `@daily` cut at 06:00 UTC rather than
+  midnight, so a run does not race the sources for the previous evening's
+  fixtures. Airflow 3 uses `schedule=`; `schedule_interval=` was removed.
+- **`catchup=False` and `max_active_runs=1`** on every DAG — non-negotiable, or a
+  stack that was off for a week fires every missed day at two rate-limited
+  sources at once, and two Spark drivers land in the scheduler container.
+- **Keep tasks small, retryable and idempotent.** The data-quality gate is the
+  one deliberate exception: `retries=0`, because corrupt rows do not improve on
+  a second read. It also owns the Gold outlets, so an asset update means
+  "loaded *and* validated".
+- **Use Airflow Connections, never hardcoded credentials.** They are defined as
+  `AIRFLOW_CONN_*` environment variables in `docker-compose.yml`;
+  `airflow/dags/football_connections.py` converts them into the config
+  dataclasses from `src/common/config.py`. Look them up at task runtime, never
+  at DAG-parse time. **`src/` must never import Airflow** — the stages have to
+  keep running under a bare `spark-submit`.
+- **Every DAG change needs a test in `tests/test_dag_integrity.py`.** A DAG that
+  raises at import does not fail loudly; Airflow records an import error and
+  schedules nothing. The same applies to a broken asset handoff, which is why
+  the tests assert that what one layer publishes is exactly what the next one
+  waits for.
 
 ---
 

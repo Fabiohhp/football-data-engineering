@@ -1,6 +1,6 @@
 """Silver -> Gold: typed Parquet in MinIO to the star schema in PostgreSQL.
 
-Run for one date; safe to re-run. Loads the four Silver tables into the ``gold``
+Run for one date; safe to re-run. Loads the five Silver tables into the ``gold``
 schema: ``dim_teams``, ``dim_players``, ``dim_referees``, ``fact_matches``,
 ``fact_player_events`` and ``fact_shots``.
 
@@ -107,6 +107,30 @@ def build_teams(fd_matches: DataFrame, understat_matches: DataFrame) -> DataFram
                 )
             ]
         )
+    )
+
+
+def build_stadiums(fd_teams: DataFrame) -> DataFrame:
+    """One row per club that has a home ground, for this run's rosters.
+
+    The grain is the *club*, not the stadium, even though this feeds a stadium
+    dimension: a fixture names clubs, so resolving ``fact_matches.stadium_key``
+    needs the club to reach the ground. Two clubs sharing a ground (Inter and
+    Milan at San Siro, Roma and Lazio at the Olimpico) therefore produce two
+    rows here and one row in ``dim_stadiums`` — the merge dedups on the name.
+
+    Clubs the source has no venue for are dropped rather than carried as a null
+    stadium; they simply keep the 'Unknown' member in the fact.
+    """
+    return (
+        fd_teams.select(
+            F.col("team").alias("team_canonical"),
+            F.col("venue").alias("stadium_name"),
+            F.col("address"),
+            F.col("country"),
+        )
+        .filter(F.col("stadium_name").isNotNull() & F.col("team_canonical").isNotNull())
+        .dropDuplicates(["team_canonical"])
     )
 
 
@@ -366,12 +390,14 @@ def run(
     spark = build_spark_session(minio, app_name="silver_to_gold")
     try:
         fd_matches = read_silver(spark, minio, "fd_matches", target_date)
+        fd_teams = read_silver(spark, minio, "fd_teams", target_date)
         understat_matches = read_silver(spark, minio, "understat_matches", target_date)
         player_events = read_silver(spark, minio, "player_events", target_date)
         shots = read_silver(spark, minio, "shots", target_date)
 
         staged_frames = {
             "teams": build_teams(fd_matches, understat_matches),
+            "stadiums": build_stadiums(fd_teams),
             "referees": build_referees(fd_matches),
             "players": build_players(player_events, understat_matches),
             "matches": build_matches(fd_matches, understat_matches, target_date),

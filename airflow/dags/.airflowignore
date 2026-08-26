@@ -1,0 +1,10 @@
+# Helper modules imported by the DAGs that define no DAG of their own. Listing
+# them here stops the dag-processor from parsing them on every cycle only to
+# report that they contain nothing.
+#
+# Written to match under both syntaxes: Airflow 2 read this file as regexps,
+# Airflow 3 reads it as globs, and a bare name means the same in each.
+assets
+football_conf.py
+football_connections.py
+football_run_date.py

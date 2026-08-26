@@ -1,3 +1,61 @@
+# Settings shared by every Airflow component. They all run the same image and
+# need the same configuration; only the `command` differs.
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: docker/airflow/Dockerfile
+  image: football-airflow:latest
+  restart: unless-stopped
+  environment: &airflow-common-env
+    # LocalExecutor: tasks run as subprocesses of the scheduler. CLAUDE.md §2
+    # says "Webserver + Scheduler + Worker", which describes CeleryExecutor, but
+    # a broker and a dedicated worker container buy nothing at this data volume
+    # (one date is ~1300 rows), and under client mode the Spark driver runs in
+    # the scheduler container and needs that headroom. See the README.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres:5432/${AIRFLOW_DB_NAME}
+    # Airflow 3 runs tasks through the Task Execution API rather than giving
+    # them direct database access, so every component needs to know where the
+    # api-server is and share the secret its tokens are signed with.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # One gunicorn/uvicorn worker: the UI serves one reviewer, not traffic.
+    AIRFLOW__API__WORKERS: "1"
+
+    # --- Connections (CLAUDE.md §7: no hardcoded credentials in DAGs) ---
+    # Defining them as AIRFLOW_CONN_* means they exist the moment the stack
+    # starts, with no `airflow connections add` bootstrap step to forget, and
+    # they never land in the metadata database. The JSON form is used rather
+    # than a URI so that passwords containing /, @ or : need no escaping.
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark-master", "port": 7077}'
+    AIRFLOW_CONN_POSTGRES_GOLD: '{"conn_type": "postgres", "host": "${POSTGRES_HOST}", "port": ${POSTGRES_PORT}, "login": "${POSTGRES_USER}", "password": "${POSTGRES_PASSWORD}", "schema": "${POSTGRES_DB}"}'
+    AIRFLOW_CONN_MINIO_DEFAULT: '{"conn_type": "aws", "login": "${MINIO_ROOT_USER}", "password": "${MINIO_ROOT_PASSWORD}", "extra": {"endpoint_url": "${MINIO_ENDPOINT}", "bronze_bucket": "${MINIO_BRONZE_BUCKET}", "silver_bucket": "${MINIO_SILVER_BUCKET}"}}'
+    AIRFLOW_CONN_FOOTBALL_DATA_API: '{"conn_type": "http", "host": "api.football-data.org", "schema": "https", "password": "${FOOTBALL_DATA_API_TOKEN}"}'
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./airflow/plugins:/opt/airflow/plugins:ro
+    - ./airflow/config:/opt/airflow/config
+    # The pipeline itself. Tasks import `src.*` (PYTHONPATH=/opt/football is set
+    # in the image) and the spark-submit driver reads the merge SQL from ./sql,
+    # mounted at the same path the Spark cluster uses so one --date argument
+    # means the same thing on both sides.
+    - ./src:/opt/football/src:ro
+    - ./sql:/opt/football/sql:ro
+    - airflow_logs:/opt/airflow/logs
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    airflow-metadb:
+      condition: service_completed_successfully
+    airflow-init:
+      condition: service_completed_successfully
+
 services:
   postgres:
     image: postgres:16
@@ -109,6 +167,123 @@ services:
       spark-master:
         condition: service_healthy
 
+  # Creates Airflow's metadata role and database inside the warehouse's
+  # PostgreSQL instance. Idempotent, and re-run on every `up` — sql/ddl runs
+  # only on a virgin data directory, which is no use to anyone whose volume
+  # predates Airflow. Uses the postgres image purely for its psql client.
+  airflow-metadb:
+    image: postgres:16
+    container_name: football-airflow-metadb
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    command:
+      - psql
+      - --host=postgres
+      - --username=${POSTGRES_USER}
+      - --dbname=${POSTGRES_DB}
+      - --set=ON_ERROR_STOP=1
+      - --set=db_user=${AIRFLOW_DB_USER}
+      - --set=db_password=${AIRFLOW_DB_PASSWORD}
+      - --set=db_name=${AIRFLOW_DB_NAME}
+      - --file=/sql/00_metadata_db.sql
+    volumes:
+      - ./sql/airflow:/sql:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Runs the schema migration and creates the admin user, then exits. With no
+  # command and _AIRFLOW_DB_MIGRATE set, the stock entrypoint does both and
+  # returns 0 — every other Airflow service waits on that success.
+  airflow-init:
+    <<: *airflow-common
+    container_name: football-airflow-init
+    restart: "no"
+    command: []
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-metadb:
+        condition: service_completed_successfully
+
+  # The UI and the Task Execution API that tasks report back through.
+  # Published on 8088: the Spark master already owns 8080 on the host.
+  airflow-apiserver:
+    <<: *airflow-common
+    container_name: football-airflow-apiserver
+    command: api-server
+    ports:
+      - "8088:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+
+  # Under LocalExecutor this process also *runs* the tasks — including the
+  # client-mode Spark driver that spark-submit starts.
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: football-airflow-scheduler
+    command: scheduler
+    environment:
+      <<: *airflow-common-env
+      # The two extract tasks are the only ones that may usefully overlap; the
+      # Spark stages are strictly sequential. Capping this keeps a replay from
+      # starting several Spark drivers at once in a container that has room for
+      # exactly one — the three layer DAGs each cap themselves at one active run,
+      # but they are separate DAGs and this is what bounds them together.
+      AIRFLOW__CORE__PARALLELISM: "4"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 45s
+    depends_on:
+      <<: *airflow-common-depends-on
+      minio:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+
+  # Airflow 3 parses DAG files in a separate process from the scheduler.
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: football-airflow-dag-processor
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 45s
+
+  # Not used by these DAGs (no deferrable operators), but a scheduler that cannot
+  # hand off to a triggerer will simply hang the first time anyone adds one.
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: football-airflow-triggerer
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 45s
+
 volumes:
   postgres_data:
   minio_data:
+  # A named volume rather than a bind mount: the Airflow image's log directory
+  # is owned by uid 50000, and bind-mounting a host directory over it makes the
+  # logs unwritable on Linux unless every reviewer first exports AIRFLOW_UID.
+  airflow_logs:

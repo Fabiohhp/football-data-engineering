@@ -104,13 +104,22 @@ def _connect(config: PostgresConfig) -> Any:
     """
     import psycopg2
 
-    return psycopg2.connect(
+    connection = psycopg2.connect(
         host=config.host,
         port=config.port,
         user=config.user,
         password=config.password,
         dbname=config.database,
     )
+    # REPEATABLE READ, not the psycopg2 default of READ COMMITTED: under READ
+    # COMMITTED every statement takes a fresh snapshot, so a Gold load
+    # committing mid-run would let one check see the state before it and the
+    # next check the state after. `fact_shots_goals_reconcile_with_player_events`
+    # compares two fact tables that a load rewrites together, and is exactly the
+    # check that would report a torn read as a violation. One snapshot for the
+    # whole run makes the report internally consistent.
+    connection.set_session(isolation_level="REPEATABLE READ", readonly=True)
+    return connection
 
 
 def run(
@@ -126,8 +135,8 @@ def run(
 
     connection = _connect(config)
     try:
-        # Read-only, but one snapshot keeps cross-table checks consistent even
-        # if a load commits underneath us.
+        # The session is read-only and REPEATABLE READ (see _connect), so every
+        # check below reads the same snapshot of the warehouse.
         with connection.cursor() as cursor:
             results = evaluate(cursor, checks)
     finally:

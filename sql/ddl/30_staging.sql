@@ -27,6 +27,18 @@ CREATE TABLE IF NOT EXISTS staging.teams (
     understat_id        INTEGER
 );
 
+-- One row per club in this run's competition rosters, carrying its home ground.
+-- Feeds two things: gold.dim_stadiums (the distinct venues) and the stadium_key
+-- on gold.fact_matches (resolved through `team_canonical`, because a fixture
+-- names clubs, not grounds). `city` and `capacity` have no source — see
+-- sql/ddl/13_dim_stadiums.sql.
+CREATE TABLE IF NOT EXISTS staging.stadiums (
+    team_canonical  TEXT,
+    stadium_name    TEXT,
+    address         TEXT,
+    country         TEXT
+);
+
 -- One row per match official seen in this run (Football-Data only).
 CREATE TABLE IF NOT EXISTS staging.referees (
     football_data_id  INTEGER,

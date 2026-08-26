@@ -10,8 +10,10 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pytest
+from src.common.team_mapping import normalize_team_name
 from src.transform.parsers import (
     parse_football_data_matches,
+    parse_football_data_teams,
     parse_understat_fixtures,
     parse_understat_rosters,
     parse_understat_shots,
@@ -379,3 +381,61 @@ def test_parse_understat_shots_handles_empty_and_malformed() -> None:
     assert parse_understat_shots({"shots": {"h": [], "a": []}}) == []
     assert parse_understat_shots({}) == []
     assert parse_understat_shots({"shots": {"h": [{"id": None, "match_id": "1"}]}}) == []
+
+
+# --- Football-Data teams / venues -------------------------------------------
+
+
+def _teams_payload(*teams: dict) -> dict:
+    return {"competition": {"code": "PL"}, "teams": list(teams)}
+
+
+def test_parse_teams_extracts_the_venue_and_conforms_the_club() -> None:
+    rows = parse_football_data_teams(
+        _teams_payload(
+            {
+                "id": 57,
+                "name": "Arsenal FC",
+                "shortName": "Arsenal",
+                "tla": "ARS",
+                "venue": "Emirates Stadium",
+                "address": "75 Drayton Park London N5 1BU",
+                "area": {"name": "England"},
+            }
+        )
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["source_team_id"] == 57
+    assert row["team_raw"] == "Arsenal FC"
+    # The canonical name is what joins this club to Understat's spelling.
+    assert row["team"] == normalize_team_name("Arsenal FC")
+    assert row["venue"] == "Emirates Stadium"
+    assert row["address"] == "75 Drayton Park London N5 1BU"
+    assert row["country"] == "England"
+    assert row["competition_code"] == "PL"
+
+
+def test_parse_teams_keeps_a_club_with_no_venue() -> None:
+    """The club still belongs in the roster; it just contributes no stadium."""
+    rows = parse_football_data_teams(
+        _teams_payload({"id": 61, "name": "Chelsea FC", "area": {"name": "England"}})
+    )
+    assert len(rows) == 1
+    assert rows[0]["venue"] is None
+
+
+def test_parse_teams_skips_records_without_an_id_or_name() -> None:
+    rows = parse_football_data_teams(
+        _teams_payload(
+            {"name": "No Id FC", "venue": "Somewhere"},
+            {"id": 99, "venue": "Nameless Park"},
+            {"id": 57, "name": "Arsenal FC", "venue": "Emirates Stadium"},
+        )
+    )
+    assert [row["source_team_id"] for row in rows] == [57]
+
+
+def test_parse_teams_tolerates_an_empty_payload() -> None:
+    assert parse_football_data_teams({}) == []

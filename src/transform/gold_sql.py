@@ -23,6 +23,7 @@ RESULT_TO_GOLD = {code: winner for winner, code in WINNER_TO_RESULT.items()}
 # what the load stages.
 STAGING_TABLES = (
     "teams",
+    "stadiums",
     "referees",
     "players",
     "matches",

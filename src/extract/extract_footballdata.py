@@ -35,6 +35,7 @@ from src.common.config import FootballDataConfig, football_data_config
 from src.common.logging import get_logger
 from src.common.minio_client import BronzeWriter, bronze_key
 from src.common.sources import FOOTBALL_DATA as SOURCE
+from src.common.sources import season_for_date
 
 logger = get_logger(__name__)
 
@@ -135,6 +136,21 @@ class FootballDataClient:
             params={"dateFrom": date_from.isoformat(), "dateTo": date_to.isoformat()},
         )
 
+    def fetch_teams(self, competition: str, season: str | None = None) -> dict[str, Any]:
+        """Fetch a competition's roster, and with it every club's home ground.
+
+        This is the pipeline's only source of venue data (``team.venue``), which
+        is what populates ``gold.dim_stadiums``.
+
+        ``season`` is the starting year ("2025" means 2025/26). Passing it
+        matters for anything but today: the endpoint defaults to the *current*
+        season, so backfilling an old date without it would resolve venues
+        against a roster that has since been promoted and relegated, and quietly
+        attach the wrong ground — or none — to a historical fixture.
+        """
+        params = {"season": season} if season else None
+        return self._get(f"/competitions/{competition}/teams", params=params)
+
 
 def extract_daily_matches(
     target_date: date | None = None,
@@ -176,7 +192,54 @@ def extract_daily_matches(
     return written
 
 
+def extract_competition_teams(
+    target_date: date | None = None,
+    competitions: tuple[str, ...] = DEFAULT_COMPETITIONS,
+    client: FootballDataClient | None = None,
+    writer: BronzeWriter | None = None,
+) -> list[str]:
+    """Extract each competition's team roster (and their venues) into Bronze.
+
+    The roster is fetched for the season ``target_date`` falls in, not the
+    current one, so a backfill resolves venues against the clubs that actually
+    played that season.
+
+    Rosters are reference data, not events: they change at most a few times a
+    season. We still re-read them every run rather than once, for two reasons —
+    it costs five of the 600 calls a day the free tier allows, and it keeps the
+    layer honest, because a promoted club or a renamed ground shows up in Gold
+    the next morning instead of whenever someone remembers to refresh it. The
+    write is idempotent (fixed key per competition and date), so a re-run
+    overwrites.
+
+    Unlike :func:`extract_daily_matches`, an empty response is still written: a
+    competition always has a roster, so "no teams" means the source changed and
+    the raw payload is exactly what we want to keep for diagnosis.
+    """
+    target = target_date or (date.today() - timedelta(days=1))
+    season = season_for_date(target)
+    client = client or FootballDataClient()
+    writer = writer or BronzeWriter()
+    writer.ensure_bucket()
+
+    written: list[str] = []
+    for competition in competitions:
+        try:
+            payload = client.fetch_teams(competition, season=season)
+        except requests.HTTPError as exc:
+            # Same rule as the match extract: one competition must not abort the
+            # others. A missing roster only costs us that league's venues.
+            logger.warning("Skipping teams for %s: %s", competition, exc)
+            continue
+
+        key = bronze_key(SOURCE, "teams", target, f"{competition}.json")
+        written.append(writer.write_json(key, payload))
+
+    logger.info("Football-Data teams extraction wrote %d object(s) for %s", len(written), target)
+    return written
+
+
 if __name__ == "__main__":  # pragma: no cover - manual/CLI entry point
-    uris = extract_daily_matches()
+    uris = extract_daily_matches() + extract_competition_teams()
     for uri in uris:
         logger.info("wrote %s", uri)

@@ -1,6 +1,6 @@
 """Bronze -> Silver: raw JSON in MinIO to typed, deduplicated Parquet.
 
-Run for one date; safe to re-run. Produces four Silver tables under
+Run for one date; safe to re-run. Produces five Silver tables under
 ``s3a://silver/``:
 
 ===================== ============================================ =============
@@ -53,6 +53,7 @@ from src.common.sources import UNDERSTAT as UNDERSTAT_SOURCE
 from src.common.sources import season_for_date
 from src.transform.parsers import (
     parse_football_data_matches,
+    parse_football_data_teams,
     parse_understat_fixtures,
     parse_understat_rosters,
     parse_understat_shots,
@@ -87,6 +88,27 @@ FD_MATCHES_SCHEMA = StructType(
         StructField("referee_source_id", IntegerType()),
         StructField("referee_name", StringType()),
         StructField("referee_nationality", StringType()),
+    ]
+)
+
+# Football-Data's competition rosters. `match_date` is the *ingestion* date, not
+# a fixture date: this is reference data, and stamping the run's date keeps the
+# table partitioned exactly like every other Silver table so `read_silver` needs
+# no special case.
+FD_TEAMS_SCHEMA = StructType(
+    [
+        StructField("source_team_id", IntegerType(), nullable=False),
+        StructField("team", StringType(), nullable=False),
+        StructField("team_raw", StringType()),
+        StructField("short_name", StringType()),
+        StructField("tla", StringType()),
+        # The club's home ground. Null for a club the source has no venue for.
+        StructField("venue", StringType()),
+        # Free-form and undecomposed — see parsers.parse_football_data_teams.
+        StructField("address", StringType()),
+        StructField("country", StringType()),
+        StructField("competition_code", StringType()),
+        StructField("match_date", DateType(), nullable=False),
     ]
 )
 
@@ -263,6 +285,21 @@ def load_fd_matches(spark: SparkSession, reader: BronzeReader, target_date: date
     return _rows_to_dataframe(spark, rows, FD_MATCHES_SCHEMA).dropDuplicates(["source_match_id"])
 
 
+def load_fd_teams(spark: SparkSession, reader: BronzeReader, target_date: date) -> DataFrame:
+    """Read Football-Data team rosters for a date into a typed DataFrame.
+
+    One club can appear in only one competition per season, but dedup on the
+    source id anyway so a re-extract into differently-named keys cannot double
+    the roster.
+    """
+    rows: list[dict[str, Any]] = []
+    for key in reader.list_keys(_bronze_date_prefix(FOOTBALL_DATA_SOURCE, "teams", target_date)):
+        for row in parse_football_data_teams(reader.read_json(key)):
+            rows.append({**row, "match_date": target_date})
+    logger.info("Football-Data: parsed %d team row(s) for %s", len(rows), target_date)
+    return _rows_to_dataframe(spark, rows, FD_TEAMS_SCHEMA).dropDuplicates(["source_team_id"])
+
+
 def load_understat_league_data(
     spark: SparkSession, reader: BronzeReader, target_date: date
 ) -> tuple[DataFrame, DataFrame]:
@@ -365,12 +402,14 @@ def run(target_date: date, config: MinioConfig | None = None) -> dict[str, int]:
     spark = build_spark_session(config)
     try:
         fd_matches = load_fd_matches(spark, reader, target_date)
+        fd_teams = load_fd_teams(spark, reader, target_date)
         fixtures, history = load_understat_league_data(spark, reader, target_date)
         events, shots = load_understat_match_data(spark, reader, target_date)
         understat_matches = enrich_fixtures_with_team_history(fixtures, history)
 
         written = {
             "fd_matches": write_silver(fd_matches, config, "fd_matches"),
+            "fd_teams": write_silver(fd_teams, config, "fd_teams"),
             "understat_matches": write_silver(understat_matches, config, "understat_matches"),
             "player_events": write_silver(
                 events.join(

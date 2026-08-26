@@ -105,6 +105,31 @@ _DIM_TEAMS = (
 
 
 # =============================================================================
+# dim_stadiums
+# =============================================================================
+
+_DIM_STADIUMS = (
+    Check(
+        name="dim_stadiums_named_ground_has_a_country",
+        table="gold.dim_stadiums",
+        severity=Severity.WARN,
+        description=(
+            "Country is the only stadium attribute Football-Data supplies besides the name and "
+            "the free-form address, so a null one means the roster payload arrived without its "
+            "area block. Not corruption — the ground still resolves — but it is the signal that "
+            "the source shape moved."
+        ),
+        sql="""
+            SELECT count(*)
+              FROM gold.dim_stadiums
+             WHERE stadium_key <> 0
+               AND country IS NULL
+        """,
+    ),
+)
+
+
+# =============================================================================
 # dim_players — the SCD Type 2 invariants no constraint can express
 # =============================================================================
 
@@ -269,6 +294,22 @@ _FACT_MATCHES = (
             SELECT count(*)
               FROM gold.fact_matches
              WHERE match_date > CURRENT_DATE
+        """,
+    ),
+    Check(
+        name="fact_matches_stadium_resolved",
+        table="gold.fact_matches",
+        severity=Severity.WARN,
+        description=(
+            "A match still pointing at the 'Unknown' ground means its home club was absent from "
+            "the competition roster this run staged. Legitimate for a club outside the big-5 "
+            "rosters, but a big-5 fixture landing here means the venue join is drifting — either "
+            "the club did not normalize or Football-Data dropped its venue."
+        ),
+        sql="""
+            SELECT count(*)
+              FROM gold.fact_matches
+             WHERE stadium_key = 0
         """,
     ),
     Check(
@@ -460,6 +501,7 @@ _FACT_SHOTS = (
 
 CHECKS: tuple[Check, ...] = (
     *_DIM_TEAMS,
+    *_DIM_STADIUMS,
     *_DIM_PLAYERS,
     *_FACT_MATCHES,
     *_FACT_PLAYER_EVENTS,

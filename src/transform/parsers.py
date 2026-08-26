@@ -165,6 +165,52 @@ def parse_football_data_matches(payload: dict[str, Any]) -> list[dict[str, Any]]
     return rows
 
 
+def parse_football_data_teams(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flatten a Football-Data ``/competitions/{code}/teams`` payload.
+
+    One row per club, carrying the club's home ground. This is the pipeline's
+    only venue source: Understat has none, and FBref (which also has capacity
+    and city) is Cloudflare-blocked.
+
+    Two fields of the source are deliberately not decomposed:
+
+    * ``address`` is free-form and country-specific — "75 Drayton Park London N5
+      1BU" has the city in the middle with no delimiter. Any split would be a
+      heuristic that quietly produces wrong cities, so the address is carried
+      through whole and ``dim_stadiums.city`` stays null.
+    * ``capacity`` does not exist on this endpoint at all.
+
+    A club with no ``venue`` is kept — it still belongs in the roster — and
+    simply contributes no stadium.
+    """
+    competition = payload.get("competition") or {}
+    competition_code = _to_str(competition.get("code"))
+
+    rows: list[dict[str, Any]] = []
+    for team in payload.get("teams", []):
+        team_id = _to_int(team.get("id"))
+        name = _to_str(team.get("name"))
+        if team_id is None or not name:
+            logger.warning("Skipping Football-Data team without id/name: %r", team.get("id"))
+            continue
+
+        area = team.get("area") or {}
+        rows.append(
+            {
+                "source_team_id": team_id,
+                "team": normalize_team_name(name),
+                "team_raw": name,
+                "short_name": _to_str(team.get("shortName")),
+                "tla": _to_str(team.get("tla")),
+                "venue": _to_str(team.get("venue")),
+                "address": _to_str(team.get("address")),
+                "country": _to_str(area.get("name")),
+                "competition_code": competition_code,
+            }
+        )
+    return rows
+
+
 def parse_understat_fixtures(
     league_data: dict[str, Any],
     league: str,

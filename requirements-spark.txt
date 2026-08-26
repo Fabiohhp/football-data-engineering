@@ -1,0 +1,11 @@
+# PySpark, installed only where a Spark transform has to actually execute: CI's
+# `spark-tests` job. Kept out of requirements.txt so the default dev install
+# stays small and JVM-free — the parsers, the merge-statement helpers and the
+# quality catalogue are all unit-tested without it, and should stay that way.
+#
+# Pin in step with docker/spark/requirements.txt and docker/airflow/Dockerfile.
+# A test suite that passes against a different PySpark than the cluster runs is
+# worth very little: the failures these tests exist to catch (a column that no
+# longer resolves, a join that silently widens) are analyzer behaviour, and the
+# analyzer is what changes between majors.
+pyspark==3.5.3

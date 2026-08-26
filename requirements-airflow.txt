@@ -1,0 +1,21 @@
+# Airflow, installed only where a DAG has to be importable: CI (for the DAG
+# tests) and the Airflow image. It is kept out of requirements.txt so the core
+# dev install stays small and JVM-free — the transform and quality code is
+# unit-tested without Airflow, and should stay that way.
+#
+# Pin in step with docker/airflow/Dockerfile and the constraints URL below,
+# otherwise CI validates a DAG against a different Airflow than the one that
+# will run it.
+#
+# Install with the matching constraints file:
+#   pip install -r requirements-airflow.txt \
+#     --constraint https://raw.githubusercontent.com/apache/airflow/constraints-3.1.8/constraints-3.11.txt
+#
+# The Spark provider is deliberately NOT listed here. It declares pyspark>=3.5.2
+# as a dependency, but its operator and hook only shell out to the `spark-submit`
+# binary and never import pyspark — so CI installs it with --no-deps and skips a
+# 300 MB wheel nothing in the test suite touches. See ci.yml.
+apache-airflow==3.1.8
+
+# The Spark provider's one other runtime import, needed because --no-deps skips it.
+apache-airflow-providers-common-compat

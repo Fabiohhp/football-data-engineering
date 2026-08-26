@@ -9,13 +9,17 @@ cursor rather than only observing it in a live run.
 
 from __future__ import annotations
 
+import sys
+import types
 from typing import Any
 
 import pytest
+from src.common.config import PostgresConfig
 from src.quality.checks import CHECKS, Check, Severity
 from src.quality.run_checks import (
     CheckResult,
     DataQualityError,
+    _connect,
     evaluate,
     run,
     summarize,
@@ -23,6 +27,7 @@ from src.quality.run_checks import (
 
 GOLD_TABLES = (
     "gold.dim_teams",
+    "gold.dim_stadiums",
     "gold.dim_players",
     "gold.fact_matches",
     "gold.fact_player_events",
@@ -208,6 +213,35 @@ def test_run_closes_the_connection_on_failure(monkeypatch: pytest.MonkeyPatch) -
     with pytest.raises(DataQualityError):
         run(config=object(), checks=(_check(),))  # type: ignore[arg-type]
     assert connection.closed
+
+
+# --- connection -------------------------------------------------------------
+
+
+def test_connect_holds_one_snapshot_for_the_whole_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """All 21 checks must read the same snapshot of the warehouse.
+
+    Under psycopg2's default READ COMMITTED every statement takes a fresh
+    snapshot, so a Gold load committing mid-run can be half-visible:
+    ``fact_shots_goals_reconcile_with_player_events`` compares two fact tables
+    that one load rewrites together, and would report the torn read as a
+    violation. That is a false alarm that fails the DAG.
+    """
+    recorded: dict[str, Any] = {}
+
+    class SessionRecordingConnection(FakeConnection):
+        def set_session(self, **kwargs: Any) -> None:
+            recorded.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg2",
+        types.SimpleNamespace(connect=lambda **kwargs: SessionRecordingConnection(FakeCursor())),
+    )
+
+    _connect(PostgresConfig(user="u", password="p", database="d", host="h", port=5432))
+
+    assert recorded == {"isolation_level": "REPEATABLE READ", "readonly": True}
 
 
 # --- report -----------------------------------------------------------------

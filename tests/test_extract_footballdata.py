@@ -7,6 +7,7 @@ from datetime import date
 from src.common.config import FootballDataConfig
 from src.extract.extract_footballdata import (
     FootballDataClient,
+    extract_competition_teams,
     extract_daily_matches,
     parse_throttle_headers,
 )
@@ -124,9 +125,15 @@ class _StubClient:
     def __init__(self, payloads: dict[str, dict]) -> None:
         self._payloads = payloads
         self.fetched: list[str] = []
+        self.seasons: list[str | None] = []
 
     def fetch_matches(self, competition: str, date_from, date_to) -> dict:
         self.fetched.append(competition)
+        return self._payloads[competition]
+
+    def fetch_teams(self, competition: str, season: str | None = None) -> dict:
+        self.fetched.append(competition)
+        self.seasons.append(season)
         return self._payloads[competition]
 
 
@@ -161,3 +168,81 @@ def test_extract_daily_matches_writes_only_competitions_with_matches() -> None:
     assert key == "football_data/matches/year=2026/month=06/day=18/PL.json"
     assert payload == payloads["PL"]
     assert uris == ["s3://bronze/football_data/matches/year=2026/month=06/day=18/PL.json"]
+
+
+def test_extract_competition_teams_writes_every_competition() -> None:
+    """Unlike the match extract, an empty roster is still written.
+
+    A competition always has teams, so a payload with none means the source
+    changed shape — exactly the case Bronze exists to preserve for diagnosis.
+    """
+    target = date(2026, 6, 18)
+    payloads = {
+        "PL": {"count": 2, "teams": [{"id": 57, "name": "Arsenal FC", "venue": "Emirates"}]},
+        "SA": {"count": 0, "teams": []},
+    }
+    client = _StubClient(payloads)
+    writer = _RecordingWriter()
+
+    uris = extract_competition_teams(
+        target_date=target, competitions=("PL", "SA"), client=client, writer=writer
+    )
+
+    assert client.fetched == ["PL", "SA"]
+    assert [key for key, _ in writer.written] == [
+        "football_data/teams/year=2026/month=06/day=18/PL.json",
+        "football_data/teams/year=2026/month=06/day=18/SA.json",
+    ]
+    assert len(uris) == 2
+
+
+def test_extract_competition_teams_survives_one_competition_failing() -> None:
+    """A roster outage in one league must not cost us the other four."""
+    import requests
+
+    class _FlakyClient(_StubClient):
+        def fetch_teams(self, competition: str, season: str | None = None) -> dict:
+            self.fetched.append(competition)
+            if competition == "PL":
+                raise requests.HTTPError("403 Forbidden")
+            return self._payloads[competition]
+
+    writer = _RecordingWriter()
+    uris = extract_competition_teams(
+        target_date=date(2026, 6, 18),
+        competitions=("PL", "SA"),
+        client=_FlakyClient({"SA": {"count": 1, "teams": []}}),
+        writer=writer,
+    )
+
+    assert len(uris) == 1
+    assert writer.written[0][0].endswith("SA.json")
+
+
+def test_extract_competition_teams_asks_for_the_season_of_the_date() -> None:
+    """A backfill must resolve venues against that season's clubs.
+
+    The endpoint defaults to the current season, so requesting a November 2025
+    date without the season would return the 2026/27 roster and attach the wrong
+    ground — or none — to a 2025/26 fixture.
+    """
+    client = _StubClient({"PL": {"count": 0, "teams": []}})
+    extract_competition_teams(
+        target_date=date(2025, 11, 1),
+        competitions=("PL",),
+        client=client,
+        writer=_RecordingWriter(),
+    )
+    assert client.seasons == ["2025"]
+
+
+def test_extract_competition_teams_rolls_the_season_before_august() -> None:
+    """January belongs to the season that started the previous August."""
+    client = _StubClient({"PL": {"count": 0, "teams": []}})
+    extract_competition_teams(
+        target_date=date(2026, 1, 15),
+        competitions=("PL",),
+        client=client,
+        writer=_RecordingWriter(),
+    )
+    assert client.seasons == ["2025"]

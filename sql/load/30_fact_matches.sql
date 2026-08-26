@@ -17,11 +17,17 @@ SELECT DISTINCT ON (s.match_date, s.home_team_canonical, s.away_team_canonical)
        ht.team_key AS home_team_key,
        at.team_key AS away_team_key,
        COALESCE(r.referee_key, 0) AS referee_key,
+       -- The ground is the *home* club's, reached club -> venue -> dimension.
+       -- Both joins are LEFT: a club missing from this run's roster payload
+       -- keeps the 'Unknown' member rather than dropping the match.
+       COALESCE(st.stadium_key, 0) AS stadium_key,
        f.match_key AS existing_match_key
 FROM staging.matches s
 JOIN gold.dim_teams ht ON ht.canonical_name = s.home_team_canonical
 JOIN gold.dim_teams at ON at.canonical_name = s.away_team_canonical
 LEFT JOIN gold.dim_referees r ON r.football_data_id = s.referee_football_data_id
+LEFT JOIN staging.stadiums sv ON sv.team_canonical = s.home_team_canonical
+LEFT JOIN gold.dim_stadiums st ON st.stadium_name = sv.stadium_name
 LEFT JOIN gold.fact_matches f
        ON (s.football_data_match_id IS NOT NULL
            AND f.football_data_match_id = s.football_data_match_id)
@@ -44,6 +50,8 @@ SET football_data_match_id = COALESCE(s.football_data_match_id, f.football_data_
     away_team_key          = s.away_team_key,
     -- Never downgrade a known official back to the 'Unknown' member.
     referee_key            = CASE WHEN s.referee_key <> 0 THEN s.referee_key ELSE f.referee_key END,
+    -- Likewise never downgrade a known ground back to the 'Unknown' member.
+    stadium_key            = CASE WHEN s.stadium_key <> 0 THEN s.stadium_key ELSE f.stadium_key END,
     home_goals             = COALESCE(s.home_goals, f.home_goals),
     away_goals             = COALESCE(s.away_goals, f.away_goals),
     home_goals_ht          = COALESCE(s.home_goals_ht, f.home_goals_ht),
@@ -74,8 +82,7 @@ INSERT INTO gold.fact_matches (
 SELECT s.football_data_match_id, s.understat_match_id,
        s.competition_code, s.competition_name, s.season, s.matchday, s.match_utc,
        s.match_date, s.status,
-       s.home_team_key, s.away_team_key, s.referee_key,
-       0,   -- stadium_key: 'Unknown' until a venue source exists (see 13_dim_stadiums.sql)
+       s.home_team_key, s.away_team_key, s.referee_key, s.stadium_key,
        s.home_goals, s.away_goals, s.home_goals_ht, s.away_goals_ht, s.result,
        s.home_xg, s.away_xg, s.home_npxg, s.away_npxg, s.home_ppda, s.away_ppda,
        s.home_deep, s.away_deep, s.home_xpts, s.away_xpts
