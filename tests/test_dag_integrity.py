@@ -35,6 +35,7 @@ from assets.football import (  # noqa: E402
     gold_football_assets,
     silver_football_assets,
 )
+from football_conf import FOOTBALL_DATA_POOL  # noqa: E402
 from football_run_date import RESOLVED_MATCH_DATE, SCHEDULED_MATCH_DATE  # noqa: E402
 
 DAGS_FOLDER = Path(__file__).resolve().parents[1] / "airflow" / "dags"
@@ -232,6 +233,38 @@ def test_backfills_cannot_stampede_the_rate_limited_sources(dags, dag_id):
     assert dags[dag_id].max_active_runs == 1
 
 
+# Everything that talks to api.football-data.org, and therefore everything that
+# spends from the one shared 10-per-minute budget. Understat is deliberately
+# absent: different host, different limit, and only one task touches it.
+FOOTBALL_DATA_TASK_IDS = (
+    "check_if_api_is_available",
+    "extract_football_data",
+    "extract_football_data_teams",
+)
+
+
+@pytest.mark.parametrize("task_id", FOOTBALL_DATA_TASK_IDS)
+def test_football_data_tasks_share_one_rate_limit_slot(dags, task_id):
+    """Per-request politeness is not enough when requests run in parallel.
+
+    The extractors honour the throttle headers, but each builds its own client
+    with its own view of the budget. Two of them running at once race for the
+    same server-side 10 calls/minute and neither can see the other's spend — the
+    exact bypass CLAUDE.md §10 forbids. The pool is what serialises them.
+    """
+    assert dags[BRONZE_DAG_ID].get_task(task_id).pool == FOOTBALL_DATA_POOL
+
+
+def test_understat_is_not_held_behind_the_football_data_limit(dags):
+    """A different host under a different limit should not queue behind this one.
+
+    Understat's politeness delay lives in its own extractor; putting it in the
+    Football-Data pool would serialise two independent sources and roughly double
+    the wall clock of a Bronze run for nothing.
+    """
+    assert dags[BRONZE_DAG_ID].get_task("extract_understat").pool == "default_pool"
+
+
 @pytest.mark.parametrize("dag_id", DAG_IDS)
 def test_every_layer_can_be_replayed_for_one_date(dags, dag_id):
     """An asset-triggered DAG has no logical date to re-run against.
@@ -288,6 +321,41 @@ def test_spark_stages_go_through_the_airflow_connection(dags, dag_id):
 def test_extractors_process_the_run_date_not_today(dags, task_id):
     task = dags[BRONZE_DAG_ID].get_task(task_id)
     assert task.op_kwargs == {"target_date": SCHEDULED_MATCH_DATE}
+
+
+def _render_scheduled_date(dag, *, ds, override=None):
+    """Render SCHEDULED_MATCH_DATE the way a task run would."""
+    from airflow.sdk.execution_time import macros
+
+    template = dag.get_template_env().from_string(SCHEDULED_MATCH_DATE)
+    return template.render(params={"match_date": override}, ds=ds, macros=macros)
+
+
+def test_bronze_processes_the_day_before_it_runs(dags):
+    """The 06:00 run of day D must ask the sources for D-1, not for D.
+
+    Airflow 3's cron timetable gives a run a zero-width data interval, so ``ds``
+    is the day the run fires rather than the day it covers. Left uncorrected,
+    breakfast on the 29th asks both sources about fixtures that kick off that
+    evening: Football-Data answers ``TIMED`` and Understat, which publishes a
+    match only once it has been played, answers with nothing. Neither is an
+    error, so the day loads with every expected-goals measure null.
+
+    Rendered rather than string-compared: the offset is the behaviour worth
+    pinning, and a future rewrite of the template should be free to look
+    different as long as the 06:00 run of the 29th still processes the 28th.
+    """
+    assert _render_scheduled_date(dags[BRONZE_DAG_ID], ds="2026-08-29") == "2026-08-28"
+
+
+def test_an_explicit_match_date_is_used_exactly_as_given(dags):
+    """A repair run aims at one day; the offset must not shift it too.
+
+    ``--conf '{"match_date": …}'`` names the match date directly, so subtracting
+    a day from it as well would silently repair the wrong day.
+    """
+    rendered = _render_scheduled_date(dags[BRONZE_DAG_ID], ds="2026-08-29", override="2025-11-01")
+    assert rendered == "2025-11-01"
 
 
 def test_availability_check_frees_its_slot_between_pokes(dags):

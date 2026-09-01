@@ -193,14 +193,26 @@ services:
       postgres:
         condition: service_healthy
 
-  # Runs the schema migration and creates the admin user, then exits. With no
-  # command and _AIRFLOW_DB_MIGRATE set, the stock entrypoint does both and
-  # returns 0 — every other Airflow service waits on that success.
+  # Runs the schema migration, creates the admin user and registers the pools,
+  # then exits. The stock entrypoint acts on the _AIRFLOW_* variables below
+  # before exec'ing `command`, so the pool is set against a schema that already
+  # exists — and because every other Airflow service waits on this container
+  # succeeding, no task can start before the pool it names is there. A task
+  # naming a missing pool does not fail; it sits queued forever.
+  #
+  # `airflow pools set` is an upsert, so re-running `docker compose up` is safe
+  # and an edited slot count takes effect on the next start.
   airflow-init:
     <<: *airflow-common
     container_name: football-airflow-init
     restart: "no"
-    command: []
+    command:
+      - bash
+      - -c
+      - >-
+        airflow pools set football_data_api_calls 1
+        "api.football-data.org - 10 calls/minute, shared server-side across every
+        task that touches it, so only one may run at a time."
     environment:
       <<: *airflow-common-env
       _AIRFLOW_DB_MIGRATE: "true"

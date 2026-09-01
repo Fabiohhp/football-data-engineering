@@ -14,16 +14,22 @@ Task                                 Does
 
 Design notes:
 
-* **The date is ``{{ ds }}``, never ``date.today()``.** ``ds`` is the run's
-  logical date, so a retry tomorrow, a manual re-run next week and a repair of an
-  old day all process the day they were meant to. The extractors write to fixed,
-  date-derived Bronze keys, so re-running a date is a correction rather than a
-  duplication. A ``match_date`` param overrides it for exactly that repair case.
-* **Scheduled at 06:00 UTC, not midnight.** The interval is still exactly one
-  day; it is cut where no fixtures are in flight. Matches finish around 22:00
-  UTC and Understat needs a couple of hours to publish shot data, so a midnight
-  ``@daily`` would race the sources for the very fixtures it exists to collect.
-  ``ds`` therefore names the previous evening's matches.
+* **The date comes from the run, never from ``date.today()``.** It is derived
+  from the run's logical date, so a retry tomorrow, a manual re-run next week and
+  a repair of an old day all process the day they were meant to. The extractors
+  write to fixed, date-derived Bronze keys, so re-running a date is a correction
+  rather than a duplication. A ``match_date`` param overrides it for exactly that
+  repair case.
+* **The run processes yesterday, not today.** Airflow 3's cron timetable makes
+  ``ds`` the day the run fires, so the 06:00 run of day D would otherwise ask
+  both sources for fixtures that kick off that evening — Football-Data returns
+  them as ``TIMED`` and Understat, which publishes only played matches, returns
+  nothing at all. :data:`SCHEDULED_MATCH_DATE` subtracts the day; see
+  :mod:`football_run_date` for why the offset is not a fudge factor.
+* **Scheduled at 06:00 UTC, not midnight.** Matches finish around 22:00 UTC and
+  Understat needs a couple of hours to publish shot data, so 06:00 the following
+  morning is comfortably clear of both — where a midnight cut would still be
+  racing the sources for the evening that just ended.
 * **Backfills are throttled by construction.** ``catchup=False`` plus
   ``max_active_runs=1`` means a stack that was switched off for a week does not
   wake up and fire seven concurrent runs at two rate-limited sources
@@ -50,7 +56,7 @@ from src.extract.extract_footballdata import (
 from src.extract.extract_understat import extract_daily_understat
 
 from assets.football import bronze_football_assets
-from football_conf import DEFAULT_ARGS, START_DATE
+from football_conf import DEFAULT_ARGS, FOOTBALL_DATA_POOL, START_DATE
 from football_connections import (
     football_data_config_from_connection,
     minio_config_from_connection,
@@ -84,8 +90,10 @@ def bronze_football_matches():
     @task.sensor(
         # `reschedule` frees the worker slot between pokes instead of holding it
         # for the whole timeout — with LocalExecutor those slots are the same
-        # ones the Spark driver will need later in the chain.
+        # ones the Spark driver will need later in the chain. It frees the pool
+        # slot too, so a poke waiting out an outage does not block the extracts.
         mode="reschedule",
+        pool=FOOTBALL_DATA_POOL,
         poke_interval=timedelta(minutes=5),
         timeout=timedelta(minutes=30),
     )
@@ -117,7 +125,7 @@ def bronze_football_matches():
             return False
         return True
 
-    @task(outlets=[bronze_football_assets["football_data"]])
+    @task(outlets=[bronze_football_assets["football_data"]], pool=FOOTBALL_DATA_POOL)
     def extract_football_data(target_date: str, *, outlet_events: Any) -> list[str]:
         """Football-Data results for one date into Bronze."""
         written = extract_daily_matches(
@@ -133,7 +141,10 @@ def bronze_football_matches():
         )
         return written
 
-    @task(outlets=[bronze_football_assets["football_data_teams"]])
+    @task(
+        outlets=[bronze_football_assets["football_data_teams"]],
+        pool=FOOTBALL_DATA_POOL,
+    )
     def extract_football_data_teams(target_date: str, *, outlet_events: Any) -> list[str]:
         """Competition rosters — and their venues — for one date into Bronze.
 
@@ -178,10 +189,13 @@ def bronze_football_matches():
         )
         return written
 
-    # Parallel rather than merged into one task: they hit different hosts under
-    # different rate limits, either can fail alone, and a retry should re-run
-    # only the source that actually failed. Silver waits for both assets, so a
-    # half-landed Bronze does not wake it.
+    # Parallel rather than merged into one task: either can fail alone, and a
+    # retry should re-run only the source that actually failed. Silver waits for
+    # every asset, so a half-landed Bronze does not wake it.
+    #
+    # "Parallel" is now bounded, though: the two Football-Data tasks share the
+    # single-slot FOOTBALL_DATA_POOL and so take turns, while Understat is a
+    # different host under a different limit and runs alongside them.
     check_if_api_is_available() >> [
         extract_football_data(target_date=SCHEDULED_MATCH_DATE),
         extract_football_data_teams(target_date=SCHEDULED_MATCH_DATE),

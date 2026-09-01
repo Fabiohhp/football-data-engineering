@@ -11,9 +11,9 @@ anyway (Bronze runs at 06:00 for the previous evening's fixtures).
 
 So the date rides along with the handoff:
 
-1. Bronze takes ``{{ ds }}`` — or the ``match_date`` param when a run is
-   repairing a specific day — and stamps it on every asset event it emits
-   (:func:`publish_match_date`).
+1. Bronze takes :data:`SCHEDULED_MATCH_DATE` — the day before its logical date,
+   or the ``match_date`` param when a run is repairing a specific day — and
+   stamps it on every asset event it emits (:func:`publish_match_date`).
 2. Silver and Gold start with :func:`resolve_match_date`, which reads that stamp
    back off the events that triggered the run and pushes it to XCom.
 3. Their Spark stages template it in as :data:`RESOLVED_MATCH_DATE`.
@@ -53,9 +53,23 @@ RESOLVE_TASK_ID = "resolve_match_date"
 # assert on.
 RESOLVED_MATCH_DATE = f"{{{{ ti.xcom_pull(task_ids='{RESOLVE_TASK_ID}') }}}}"
 
-# What the cron-scheduled DAG hands to its tasks: the run's own logical date,
-# unless the run was triggered with an explicit date to repair.
-SCHEDULED_MATCH_DATE = "{{ params.match_date or ds }}"
+# What the cron-scheduled DAG hands to its tasks: the day *before* the run's own
+# logical date, unless the run was triggered with an explicit date to repair.
+#
+# The -1 is the point of this constant, not a fudge factor. Airflow 3's cron
+# timetable gives a run a zero-width data interval — `data_interval_start ==
+# data_interval_end == logical_date == the moment it fires — so `{{ ds }}` on the
+# 06:00 run of the 29th is "2026-08-29", and the fixtures of the 29th kick off
+# that evening, twelve hours later. Understat publishes a match only once it has
+# been played (`isResult`), so a same-day run collects zero xG without failing,
+# and Gold loads a night of TIMED fixtures with every expected-goals measure null.
+#
+# Under Airflow 2 the interval was [06:00 D-1, 06:00 D) and `ds` was already the
+# previous day — which is what the docstrings around this pipeline assumed. The
+# Airflow 3 timetable moved the date forward by a day without breaking anything
+# loudly. This restores the intended meaning: the 06:00 run of day D processes
+# day D-1's fixtures, by which time both sources have published.
+SCHEDULED_MATCH_DATE = "{{ params.match_date or macros.ds_add(ds, -1) }}"
 
 # Offered by all three DAGs so that any layer can be re-run for one specific day
 # from the UI or the CLI: `--conf '{"match_date": "2025-11-01"}'`. Without it,

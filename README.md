@@ -113,31 +113,53 @@ docker compose exec airflow-scheduler airflow dags trigger silver_football_match
   waits for *all three* Bronze assets, Gold for *all five* Silver tables.
 - **The date travels with the handoff.** An asset-triggered run has no logical
   date of its own, and the wall clock is not the match date anyway (Bronze runs
-  at 06:00 for the previous evening's fixtures). So Bronze stamps `{{ ds }}` onto
-  every asset event it publishes, and `resolve_match_date` reads it back off the
+  at 06:00 for the previous evening's fixtures). So Bronze stamps the date it
+  resolved onto every asset event it publishes, and `resolve_match_date` reads it back off the
   triggering events downstream. A run triggered with no date at all, or by
   events carrying two different dates, fails with a message saying how to re-run
   it — inventing one from the clock is the bug this design exists to prevent.
   Any DAG also accepts `--conf '{"match_date": …}'` to aim a run at one day.
-- **The date is `{{ ds }}`, never `date.today()`.** Every stage already took an
-  explicit date, so the DAGs supply one and nothing else. A retry after midnight,
-  a manual re-run and a repair therefore all process the day they were meant to —
-  a task that computed "yesterday" itself would look correct until the first
-  retry and then overwrite a good partition with an empty one. Tests assert the
-  templating rather than trusting it.
+- **The date comes from the run, never from `date.today()`.** Every stage already
+  took an explicit date, so the DAGs supply one and nothing else. A retry after
+  midnight, a manual re-run and a repair therefore all process the day they were
+  meant to — a task that computed "yesterday" itself would look correct until the
+  first retry and then overwrite a good partition with an empty one. Tests assert
+  the templating rather than trusting it.
+- **Bronze processes yesterday: `macros.ds_add(ds, -1)`.** Airflow 3's cron
+  timetable gives a run a *zero-width* data interval — `data_interval_start ==
+  data_interval_end == logical_date == the moment it fires — so `{{ ds }}` on the
+  06:00 run of day D is D itself, whose fixtures kick off that evening. Asking
+  the sources for them at breakfast returns `TIMED` rows from Football-Data and
+  nothing at all from Understat, which publishes a match only once it has been
+  played. The result is not an error, it is a night of matches loaded with every
+  expected-goals measure null. Under Airflow 2 the interval was
+  `[06:00 D-1, 06:00 D)` and `ds` was already the previous day, which is why this
+  needed to become explicit on the way to Airflow 3.
 - **Gold is published by the quality gate, not by the load.** The Gold assets are
   the contract with the analytics and ML subprojects, so their events are emitted
   by `data_quality_check`: an update means "loaded *and* validated", and a future
   consumer subscribing to `gold_fact_matches` never wakes up on a bad night.
-- **Scheduled at 06:00 UTC, not midnight.** The interval is still exactly one
-  day; it is just cut where no fixtures are in flight. Matches finish around
-  22:00 UTC and Understat needs a couple of hours to publish shot data, so a
-  midnight `@daily` would race the sources for the very fixtures it exists to
-  collect.
+- **Scheduled at 06:00 UTC, not midnight.** Combined with the day offset above,
+  a run wakes up a full eight hours after the last fixture of the day it is about
+  to process. Matches finish around 22:00 UTC and Understat needs a couple of
+  hours to publish shot data, so a midnight cut would still be racing the sources
+  for the evening that had just ended.
 - **Backfills cannot stampede the sources.** `catchup=False` with
   `max_active_runs=1`: a stack switched off for a week does not wake up and fire
   seven concurrent runs at two rate-limited sources. Missed days are re-run
   deliberately, one at a time.
+- **One pool guards the Football-Data rate limit.** Per-request politeness is
+  not enough once requests run in parallel: the sensor and the two Football-Data
+  extractors each build their own client with their own view of the
+  10-calls-per-minute budget, but that budget is enforced server-side and shared.
+  Running them at once means racing for it with no task able to see another's
+  spend. All three therefore hold a slot in the single-slot
+  `football_data_api_calls` pool, so only one talks to the API at a time and its
+  client's view of the budget is authoritative again. Understat stays out of it —
+  different host, different limit, and serialising the two independent sources
+  would roughly double a Bronze run for nothing. The pool is registered by
+  `airflow-init` (an upsert, so `docker compose up` is safe to repeat); a task
+  naming a pool that does not exist sits queued forever instead of failing.
 - **Credentials come from Airflow Connections, never from the DAG.** The four
   connections (`spark_default`, `postgres_gold`, `minio_default`,
   `football_data_api`) are defined as `AIRFLOW_CONN_*` environment variables in

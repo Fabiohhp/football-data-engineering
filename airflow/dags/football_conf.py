@@ -18,11 +18,27 @@ from football_connections import SPARK_CONN_ID, spark_env_templates
 
 __all__ = [
     "DEFAULT_ARGS",
+    "FOOTBALL_DATA_POOL",
     "PROJECT_ROOT",
     "START_DATE",
     "SparkSubmitOperatorConf",
     "spark_application",
 ]
+
+# Every task that talks to api.football-data.org holds a slot in this pool, and
+# the pool has exactly one. The free tier's 10-calls-per-minute budget is
+# enforced server-side and shared across the whole project, but each task builds
+# its own FootballDataClient with its own throttle state — two of them running
+# in parallel race for the same budget and neither can see the other's spend.
+# One slot makes the client's view of the budget authoritative again.
+#
+# Created by the airflow-init service in docker-compose.yml; a task naming a
+# pool that does not exist stays queued forever rather than failing loudly.
+#
+# `_calls`, because `football_data_api` is already the Connection that holds the
+# token. Pools and connections are separate namespaces so Airflow would accept
+# the collision, but nothing in a log line says which of the two it means.
+FOOTBALL_DATA_POOL = "football_data_api_calls"
 
 # The date the pipeline was first verified end-to-end. Aware, because Airflow
 # rejects a naive start_date; identical across the three DAGs so that they
