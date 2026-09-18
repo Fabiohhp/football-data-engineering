@@ -113,6 +113,11 @@ _ALIASES: dict[str, tuple[str, ...]] = {
         "Deportivo",
     ),
     "Racing Santander": ("Real Racing Club de Santander", "Racing de Santander"),
+    # Relegated after 2024/25, so absent from the current-season roster the rest
+    # of this table was harvested from — and therefore missing until the
+    # 2024/25 backfill split each of them into two clubs.
+    "Las Palmas": ("UD Las Palmas",),
+    "Leganés": ("CD Leganés",),
     # --- Bundesliga / Germany ------------------------------------------------
     "Bayern Munich": (
         "FC Bayern München",
@@ -144,6 +149,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "Schalke 04": ("FC Schalke 04", "Schalke"),
     "Paderborn": ("SC Paderborn 07", "SC Paderborn"),
     "Elversberg": ("SV 07 Elversberg", "SV Elversberg"),
+    "Bochum": ("VfL Bochum 1848", "VfL Bochum"),
     # --- Serie A / Italy -----------------------------------------------------
     "Inter Milan": ("Inter", "FC Internazionale Milano", "Internazionale"),
     "AC Milan": ("Milan",),
@@ -189,6 +195,9 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "Paris FC": (),
     "Troyes": ("ES Troyes AC", "ESTAC Troyes"),
     "Le Mans": ("Le Mans FC",),
+    "Saint-Étienne": ("AS Saint-Étienne", "AS Saint-Etienne", "St Etienne"),
+    "Montpellier": ("Montpellier HSC",),
+    "Reims": ("Stade de Reims",),
 }
 
 # Suffixes/prefixes stripped in the best-effort fallback for unknown clubs.

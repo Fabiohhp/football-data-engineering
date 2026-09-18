@@ -55,6 +55,16 @@ def test_football_data_and_understat_names_agree() -> None:
         ("Marseille", "Olympique de Marseille"),
         ("Lyon", "Olympique Lyonnais"),
         ("Alaves", "Deportivo Alavés"),
+        # Clubs that left the big-5 before the current season: the table was
+        # harvested from current rosters, so the 2024/25 backfill found no alias
+        # for either spelling and minted two clubs per fixture — results under
+        # one, xG under the other, 204 of 2024/25's fixtures split in half.
+        ("Saint-Etienne", "AS Saint-Étienne"),
+        ("Bochum", "VfL Bochum 1848"),
+        ("Leganes", "CD Leganés"),
+        ("Las Palmas", "UD Las Palmas"),
+        ("Montpellier", "Montpellier HSC"),
+        ("Reims", "Stade de Reims"),
     ],
 )
 def test_cross_source_pairs_resolve_to_one_canonical(understat: str, football_data: str) -> None:

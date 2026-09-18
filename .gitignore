@@ -28,3 +28,4 @@ airflow/webserver_config.py
 
 # OS
 .DS_Store
+.backfill/
