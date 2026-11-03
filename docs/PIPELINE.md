@@ -445,11 +445,12 @@ Design notes:
 - **All checks run before anything raises**, so one red run shows the whole
   shape of the problem rather than just its first symptom.
 
-Coverage: 23 checks — cross-source id collisions and unconformed clubs
+Coverage: 24 checks — cross-source id collisions and unconformed clubs
 (`dim_teams`); a ground missing its country (`dim_stadiums`); overlapping
 versions, current-flag consistency, every player
 having a current version (`dim_players`); fixture-grain duplication, missing
-scores on finished matches, result/score agreement (`fact_matches`); the same
+scores on finished matches, result/score agreement, a finished match Understat
+never delivered (`fact_matches`); the same
 player counted twice under two versions, and the club they played for disagreeing
 with their dimension version (`fact_player_events`); matches still pointing at the
 `Unknown` ground (`fact_matches`); pitch coordinates, and goals
@@ -457,12 +458,20 @@ reconciling against `fact_player_events` (`fact_shots`). Each fact table is
 guarded against `Unknown`-member leakage, which is how an unresolved key
 surfaces given the `NOT NULL` FKs — a test enforces that guard exists.
 
-**Verified by fault injection.** All 23 pass on the loaded warehouse, but a check
+**Verified by fault injection.** All 24 pass on the recorded date, but a check
 that never fires proves nothing. Each was re-run against a deliberately corrupted
 copy of its target table inside a rolled-back transaction — a duplicated fixture,
 a nulled score, an overlapping SCD window, an out-of-pitch coordinate, and so on.
 **21/21 detected the violation they claim to catch**, and the rollbacks left row
 counts unchanged. (The two venue checks added since are not in that count.)
+
+The xG coverage check came later too, and it was tested on real loads instead. With
+Serie A's Understat payloads held back from the recorded date, it reported that
+league's 3 matches; with them restored and the date replayed, xG was back on all 23
+and it reported none. It is a WARN because Football-Data and Understat date some
+fixtures differently: 11 of the 12 finished matches without xG in the 3,733-match
+snapshot have their Understat row a day or two away. The other one, Rennes v Paris
+Saint-Germain on 2026-08-23, is the only match it reports on that snapshot.
 
 ## Development
 

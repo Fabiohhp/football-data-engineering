@@ -9,6 +9,7 @@ cursor rather than only observing it in a live run.
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import types
 from typing import Any
@@ -140,6 +141,41 @@ def test_severities_are_valid() -> None:
         assert check.severity in (Severity.ERROR, Severity.WARN)
 
 
+@pytest.mark.parametrize(
+    ("rows", "missing"),
+    [
+        pytest.param([("FINISHED", 7, 1, 2, 100, 1.2)], 0, id="has xG"),
+        pytest.param([("FINISHED", None, 1, 2, 100, None)], 1, id="never delivered"),
+        pytest.param([("TIMED", None, 1, 2, 100, None)], 0, id="not played yet"),
+        pytest.param(
+            [("FINISHED", None, 1, 2, 100, None), ("FINISHED", 7, 1, 2, 101, 1.2)],
+            0,
+            id="the sources date it a day apart",
+        ),
+        pytest.param(
+            [("FINISHED", None, 1, 2, 100, None), ("FINISHED", 7, 1, 2, 465, 1.2)],
+            1,
+            id="the same fixture a season later",
+        ),
+    ],
+)
+def test_missing_xg_check_counts_only_what_understat_never_delivered(
+    rows: list[tuple], missing: int
+) -> None:
+    """SQLite has no date type, so ``match_date`` is a day number here: subtracting two
+    gives days, as subtracting two Postgres dates does."""
+    check = next(c for c in CHECKS if c.name == "fact_matches_finished_have_xg")
+    con = sqlite3.connect(":memory:")
+    con.execute("ATTACH ':memory:' AS gold")
+    con.execute(
+        "CREATE TABLE gold.fact_matches "
+        "(status, understat_match_id, home_team_key, away_team_key, match_date, home_xg)"
+    )
+    con.executemany("INSERT INTO gold.fact_matches VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+    assert con.execute(check.sql).fetchone()[0] == missing
+
+
 # --- result semantics -------------------------------------------------------
 
 
@@ -219,7 +255,7 @@ def test_run_closes_the_connection_on_failure(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_connect_holds_one_snapshot_for_the_whole_run(monkeypatch: pytest.MonkeyPatch) -> None:
-    """All 21 checks must read the same snapshot of the warehouse.
+    """All the checks must read the same snapshot of the warehouse.
 
     Under psycopg2's default READ COMMITTED every statement takes a fresh
     snapshot, so a Gold load committing mid-run can be half-visible:

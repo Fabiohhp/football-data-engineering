@@ -328,6 +328,31 @@ _FACT_MATCHES = (
                 OR (away_xg IS NOT NULL AND (away_xg < 0 OR away_xg > 15))
         """,
     ),
+    Check(
+        name="fact_matches_finished_have_xg",
+        table="gold.fact_matches",
+        severity=Severity.WARN,
+        description=(
+            "A finished match with no xG and no Understat row for that fixture within a week: "
+            "Understat never delivered it, which is what a league the extractor skipped leaves "
+            "behind. WARN because a source can omit a match, and a fixture the two sources date "
+            "differently only finds its Understat row once that other date is loaded."
+        ),
+        sql="""
+            SELECT count(*)
+              FROM gold.fact_matches m
+             WHERE m.status = 'FINISHED'
+               AND m.home_xg IS NULL
+               AND NOT EXISTS (
+                     SELECT 1
+                       FROM gold.fact_matches twin
+                      WHERE twin.home_team_key = m.home_team_key
+                        AND twin.away_team_key = m.away_team_key
+                        AND twin.understat_match_id IS NOT NULL
+                        AND abs(twin.match_date - m.match_date) <= 7
+                   )
+        """,
+    ),
 )
 
 

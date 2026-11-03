@@ -30,7 +30,7 @@ flowchart LR
     subgraph AF["Airflow: one DAG per layer, chained by assets"]
         B["Bronze<br/>raw JSON on MinIO"] -->|PySpark| S["Silver<br/>typed Parquet on MinIO"]
         S -->|"PySpark, then a SQL merge"| G["Gold<br/>star schema in PostgreSQL"]
-        G --> Q{"23 quality<br/>checks"}
+        G --> Q{"24 quality<br/>checks"}
     end
     Q -->|"pass: Gold assets published"| P2["Part 2: analytics"]
     P2 --> P3["Part 3: ML"]
@@ -48,7 +48,7 @@ minutes: Bronze 1m38s, Silver 17s, Gold 15s, 10 of 10 tasks on the first attempt
 | Processing | PySpark 3.5.3 on a standalone cluster | schemas are declared rather than inferred, and a re-run replaces exactly one date's partition |
 | Warehouse | PostgreSQL 16: four dimensions, three facts, SCD Type 2 on players | a stable contract for Parts 2 and 3; transfers are tracked rather than overwritten |
 | Loading | Spark lands rows in staging, SQL merges them in one transaction | Spark's JDBC writer only appends or overwrites, and neither is an upsert |
-| Quality | 23 SQL checks, ERROR or WARN | only rules the schema cannot express, so a known source quirk does not redden the DAG nightly |
+| Quality | 24 SQL checks, ERROR or WARN | only rules the schema cannot express, so a known source quirk does not redden the DAG nightly |
 
 Every DAG, layer, table and check is documented in [`docs/PIPELINE.md`](docs/PIPELINE.md), with
 the reasoning and how each was verified.
@@ -64,12 +64,12 @@ the work went into making those failures loud.
 again after it had already been loaded: 23 matches, 715 player events and 540 shots, unchanged,
 with no surrogate keys burned. A failure anywhere in the merge leaves Gold exactly as it was.
 
-**A quality gate that has been seen to fire.** The 23 checks cover what a schema cannot state: an
+**A quality gate that has been seen to fire.** The 24 checks cover what a schema cannot state: an
 SCD window that overlaps, a `result` contradicting its own score, goals that do not reconcile
 between two fact tables. Each was run against a deliberately corrupted copy of its table inside a
 rolled-back transaction, and **21 of 21 detected the violation they claim to catch** (the two venue
-checks came later and are not in that count). The Gold assets are emitted by the gate, so an update
-means "loaded *and* validated".
+checks and the xG coverage check came later and are not in that count). The Gold assets are emitted
+by the gate, so an update means "loaded *and* validated".
 
 **The checks caught a real problem.** `dim_players` only opens versions going forward, so a date
 loaded out of order attaches a player's goals to a club they had not joined yet. One date loaded
@@ -85,7 +85,7 @@ for `macros.ds_add(ds, -1)`, and a test renders the template rather than trustin
 agree on 23 of 23 scorelines, an independent check that team names are being matched to the right
 clubs.
 
-**A green CI means the tests ran.** 144 test functions across three jobs: a JVM-free core, the DAGs
+**A green CI means the tests ran.** 145 test functions across three jobs: a JVM-free core, the DAGs
 on a real Airflow install, and the transforms on real PySpark DataFrames. The last two first assert
 that their dependency imports, because `pytest.importorskip` on a degraded install would report
 "skipped" and go green having verified nothing.
@@ -104,8 +104,9 @@ that their dependency imports, because `pytest.importorskip` on a degraded insta
   and capacity have no source either, and those two columns stay null.
 - **One source is a scraped website.** Understat has no official API and no uptime promise, and in
   November 2026 it stopped answering and then served only a maintenance page. The daily extraction
-  then fails loudly and nothing downstream runs. The [recorded date](#reproduce-a-real-date)
-  exercises the rest of the chain without it.
+  then fails loudly and nothing downstream runs. If just one league cannot be read, the others still
+  load, the gate reports its matches as a warning, and replaying the date later fills the gap. The
+  [recorded date](#reproduce-a-real-date) exercises the rest of the chain without Understat.
 - **Rate limits set the pace.** Understat takes about 3 seconds per request and Football-Data allows
   10 calls a minute, so a backfill of whole seasons is slow by design.
 
