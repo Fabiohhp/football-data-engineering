@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+import requests
+from src.common.config import UnderstatConfig
 from src.extract.extract_understat import (
+    UnderstatClient,
+    UnderstatUnavailable,
     extract_daily_understat,
     match_ids_for_date,
     season_for_date,
@@ -92,3 +97,62 @@ def test_extract_daily_understat_writes_league_and_each_match() -> None:
         "understat/match_data/year=2026/month=06/day=18/101.json",
     ]
     assert len(uris) == 3
+
+
+class _MaintenanceSession(requests.Session):
+    """Answers every request the way understat.com did in November 2026."""
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        response._content = b"<html><body>We will come back soon</body></html>"
+        return response
+
+
+def test_extract_daily_understat_fails_on_a_maintenance_page() -> None:
+    client = UnderstatClient(
+        config=UnderstatConfig(),
+        session=_MaintenanceSession(),
+        sleep=lambda _: None,
+    )
+    writer = _RecordingWriter()
+
+    with pytest.raises(UnderstatUnavailable, match="2025-11-01"):
+        extract_daily_understat(target_date=date(2025, 11, 1), client=client, writer=writer)
+
+    assert writer.written == []
+
+
+def test_extract_daily_understat_accepts_a_day_with_no_matches() -> None:
+    client = _StubClient({"dates": []}, {})
+    writer = _RecordingWriter()
+
+    uris = extract_daily_understat(
+        target_date=date(2026, 6, 18), leagues=("EPL",), client=client, writer=writer
+    )
+
+    assert len(uris) == 1
+    assert client.match_calls == []
+
+
+def test_extract_daily_understat_skips_one_failing_league() -> None:
+    class _OneLeagueDown(_StubClient):
+        def fetch_league_data(self, league: str, season: str) -> dict:
+            if league == "EPL":
+                raise ValueError("not JSON")
+            return super().fetch_league_data(league, season)
+
+    writer = _RecordingWriter()
+
+    uris = extract_daily_understat(
+        target_date=date(2026, 6, 18),
+        leagues=("EPL", "Serie_A"),
+        client=_OneLeagueDown({"dates": []}, {}),
+        writer=writer,
+    )
+
+    assert [k for k, _ in writer.written] == [
+        "understat/league_data/year=2026/month=06/day=18/Serie_A_2025.json"
+    ]
+    assert len(uris) == 1

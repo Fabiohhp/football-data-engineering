@@ -49,6 +49,7 @@ __all__ = [
     "DEFAULT_LEAGUES",
     "SOURCE",
     "UnderstatClient",
+    "UnderstatUnavailable",
     "extract_daily_understat",
     "match_ids_for_date",
     "season_for_date",
@@ -71,6 +72,10 @@ _BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+
+class UnderstatUnavailable(RuntimeError):
+    """Understat answered, but not one league came back as data."""
 
 
 def match_ids_for_date(league_data: dict[str, Any], target_date: date) -> list[str]:
@@ -150,6 +155,12 @@ def extract_daily_understat(
     fixture list and season aggregates), then fetch and store only the matches
     played on ``target_date``. Returns the Bronze URIs written. A single
     failing league/match is logged and skipped rather than aborting the run.
+
+    Raises ``UnderstatUnavailable`` when no league at all could be read. A day with
+    no fixtures still stores every league's payload, so nothing written means the
+    source is down. Understat's maintenance page answers 200 with HTML, which no
+    network error reports; returning normally would publish the Bronze asset and
+    send Silver and Gold a night with no xG, players or shots.
     """
     client = client or UnderstatClient()
     writer = writer or BronzeWriter()
@@ -177,6 +188,9 @@ def extract_daily_understat(
                 continue
             match_key = bronze_key(SOURCE, "match_data", target_date, f"{match_id}.json")
             written.append(writer.write_json(match_key, match_data))
+
+    if not written:
+        raise UnderstatUnavailable(f"No league could be read from Understat for {target_date}")
 
     logger.info("Understat extraction wrote %d object(s) for %s", len(written), target_date)
     return written

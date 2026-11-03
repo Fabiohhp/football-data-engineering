@@ -85,7 +85,7 @@ for `macros.ds_add(ds, -1)`, and a test renders the template rather than trustin
 agree on 23 of 23 scorelines, an independent check that team names are being matched to the right
 clubs.
 
-**A green CI means the tests ran.** 141 test functions across three jobs: a JVM-free core, the DAGs
+**A green CI means the tests ran.** 144 test functions across three jobs: a JVM-free core, the DAGs
 on a real Airflow install, and the transforms on real PySpark DataFrames. The last two first assert
 that their dependency imports, because `pytest.importorskip` on a degraded install would report
 "skipped" and go green having verified nothing.
@@ -103,8 +103,9 @@ that their dependency imports, because `pytest.importorskip` on a degraded insta
   and is Cloudflare-blocked, so they are left out rather than shipped as empty columns. Stadium city
   and capacity have no source either, and those two columns stay null.
 - **One source is a scraped website.** Understat has no official API and no uptime promise, and in
-  November 2026 it was not answering. The daily extraction then fails loudly and nothing downstream
-  runs. The [recorded date](#reproduce-a-real-date) exercises the rest of the chain without it.
+  November 2026 it stopped answering and then served only a maintenance page. The daily extraction
+  then fails loudly and nothing downstream runs. The [recorded date](#reproduce-a-real-date)
+  exercises the rest of the chain without it.
 - **Rate limits set the pace.** Understat takes about 3 seconds per request and Football-Data allows
   10 calls a minute, so a backfill of whole seasons is slow by design.
 
