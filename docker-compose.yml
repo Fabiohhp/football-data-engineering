@@ -77,7 +77,9 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio:latest
+    # The official minio/minio image is no longer on Docker Hub. This is a community-maintained
+    # build of the same server, pinned, and it ships `mc` for the healthcheck below.
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     container_name: football-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -128,6 +130,8 @@ services:
       - ./src:/opt/football/src:ro
       # The merge statements are read at run time by the driver.
       - ./sql:/opt/football/sql:ro
+      # The recorded Bronze date, for `python -m src.extract.seed_bronze`.
+      - ./data/sample_bronze:/opt/football/data/sample_bronze:ro
     depends_on:
       minio:
         condition: service_healthy
