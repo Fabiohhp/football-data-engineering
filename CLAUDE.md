@@ -28,8 +28,8 @@ alone — do not treat the analytics or ML phases as part of this file's scope.
 | Phase | Scope | Covered by this CLAUDE.md? | Status |
 |-------|-------|----------------------------|--------|
 | **Part 1 — Data Engineering & Architecture** | Ingestion, orchestration, lakehouse, dimensional modeling, data quality, CI/CD | ✅ Yes — this file | **Complete** |
-| Part 2 — Analytics & BI | Dashboards, KPIs, exploratory analysis on top of the Gold layer | ❌ No (separate subproject, own context) | Not started |
-| Part 3 — Machine Learning | Match outcome / xG prediction models trained on the Gold tables this project produces | ❌ No (separate subproject, own context) | Not started |
+| Part 2 — Analytics & BI | Dashboards, KPIs, exploratory analysis on top of the Gold layer | ❌ No (separate subproject, own context) | Complete, in `football-data-analytics` |
+| Part 3 — Machine Learning | Match outcome / xG prediction models trained on the Gold tables this project produces | ❌ No (separate subproject, own context) | Complete, in `football-data-science` |
 
 **Implications for any code you write under this subproject:**
 
@@ -219,6 +219,9 @@ black --check src tests airflow/dags
 # Silver, which triggers Gold. Nothing else needs to be started by hand.
 docker compose exec airflow-scheduler airflow dags trigger bronze_football_matches \
   --conf '{"match_date": "2025-11-01"}'
+
+# The same chain with neither source nor token: load the recorded date, then trigger Silver.
+docker compose exec -w /opt/football spark-master python -m src.extract.seed_bronze
 
 # Re-run one layer only (repairing Silver or Gold without re-scraping Bronze).
 docker compose exec airflow-scheduler airflow dags trigger silver_football_matches \
